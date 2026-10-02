@@ -1,29 +1,5 @@
 
-```markdown
 # Ubuntu-PLUS Transformer
-
-**Wandle dein Ubuntu in Ubuntu-PLUS um – schnell, einfach, vollautomatisch.**
-
-
-## 📋 Inhaltsverzeichnis
-
-- [Was ist der Ubuntu-PLUS Transformer?](#-was-ist-der-ubuntu-plus-transformer)
-- [Systemvoraussetzungen](#-systemvoraussetzungen)
-- [Installation](#-installation)
-- [Verwendung](#-verwendung)
-  - [Grafischer Assistent (GUI)](#grafischer-assistent-gui)
-  - [Kommandozeile (CLI)](#kommandozeile-cli)
-- [Was macht der Transformer?](#-was-macht-der-transformer)
-- [Parameter-Übersicht (CLI)](#-parameter-übersicht-cli)
-- [Selbst-Deinstallation](#-selbst-deinstallation)
-- [Deinstallation](#-deinstallation)
-- [Häufige Fragen (FAQ)](#-häufige-fragen-faq)
-- [Fehlerbehebung](#-fehlerbehebung)
-- [Für Entwickler](#-für-entwickler)
-- [Lizenz](#-lizenz)
-- [Danksagung](#-danksagung)
-
----
 
 ## 🎯 Was ist der Ubuntu-PLUS Transformer?
 
