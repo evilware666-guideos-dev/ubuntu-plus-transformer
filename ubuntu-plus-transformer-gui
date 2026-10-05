@@ -1,0 +1,2535 @@
+#!/usr/bin/env python3
+# Ubuntu-PLUS Transformer – GTK4-Adwaita-Assistent (GUI)
+# (c) 2026 – Freigegeben unter GPL v3
+#
+# Änderungen in dieser Version:
+#   • Selbst-Deinstallation läuft im CLI-Skript (Boot-Time-Service + systemd-run)
+#   • _on_success_dialog_response korrekt als Methode definiert
+#   • Non-blocking Reboot via GLib.timeout_add
+#   • Erfolgs-Dialog-Text: "entfernt sich jetzt automatisch"
+#   • Live-System-Erkennung
+#   • pkexec-Aufruf EINFACH (Polkit-Policy matcht)
+#   • GTK4: add_css_class() statt get_style_context().add_class()
+
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+gi.require_version('Gdk', '4.0')
+from gi.repository import Gtk, Adw, GLib, Gdk, Gio
+import subprocess
+import sys
+import threading
+import os
+import time
+import webbrowser
+import pwd
+
+COLOR_INSTALLED     = "#2ec27e"
+COLOR_NOT_INSTALLED = "#9a9996"
+COLOR_REMOVE        = "#e01b24"
+COLOR_INFO          = "#3584e4"
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+WALLPAPER_USER_DIR   = os.path.expanduser("~/Bilder")
+
+WALLPAPER_PLUS_CANDIDATES = [
+    "/usr/share/ubuntu-plus-transformer/Wallpaper",
+    os.path.normpath(os.path.join(SCRIPT_DIR, "..", "share", "ubuntu-plus-transformer", "Wallpaper")),
+    os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "usr", "share", "ubuntu-plus-transformer", "Wallpaper")),
+    os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "..", "usr", "share", "ubuntu-plus-transformer", "Wallpaper")),
+]
+
+WALLPAPER_EXTRA_CANDIDATES = [
+    "/usr/share/ubuntu-plus-transformer/backgrounds",
+    "/usr/share/ubuntu-plus-transformer/ExtraWallpaper",
+    "/usr/local/share/ubuntu-plus-transformer/backgrounds",
+    "/usr/local/share/ubuntu-plus-transformer/ExtraWallpaper",
+    os.path.normpath(os.path.join(SCRIPT_DIR, "..", "share", "ubuntu-plus-transformer", "backgrounds")),
+    os.path.normpath(os.path.join(SCRIPT_DIR, "..", "share", "ubuntu-plus-transformer", "ExtraWallpaper")),
+    os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "usr", "share", "ubuntu-plus-transformer", "backgrounds")),
+    os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "usr", "share", "ubuntu-plus-transformer", "ExtraWallpaper")),
+    os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "..", "usr", "share", "ubuntu-plus-transformer", "backgrounds")),
+    os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "..", "usr", "share", "ubuntu-plus-transformer", "ExtraWallpaper")),
+    os.path.expanduser("~/ExtraWallpaper"),
+    os.path.expanduser("~/Extra-Wallpaper"),
+]
+
+WALLPAPER_UBUNTU_CANDIDATES = [
+    "/usr/share/backgrounds",
+    "/usr/share/gnome-background-properties",
+]
+
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+
+WALLPAPER_CSS = """
+.wallpaper-scroll scrollbar slider {
+    background-color: #3584e4;
+    min-width: 10px;
+    min-height: 10px;
+    border-radius: 5px;
+}
+.wallpaper-scroll scrollbar slider:hover {
+    background-color: #62a0ea;
+}
+.wallpaper-scroll scrollbar slider:active {
+    background-color: #1c71d8;
+}
+.wallpaper-scroll scrollbar trough {
+    background-color: rgba(53, 132, 228, 0.15);
+    border-radius: 5px;
+}
+.wallpaper-section-title {
+    font-weight: bold;
+    font-size: 1.05em;
+}
+.wallpaper-thumb-frame {
+    border-radius: 8px;
+    background-color: transparent;
+    transition: all 150ms ease;
+}
+.wallpaper-thumb-frame-selected {
+    background-color: rgba(53, 132, 228, 0.20);
+    box-shadow: 0 0 0 3px #3584e4;
+}
+""".encode('utf-8')
+
+
+def _first_existing_dir(candidates, default=""):
+    for d in candidates:
+        if os.path.isdir(d):
+            return d
+    return default
+
+
+def check_flatpak_app(app_id):
+    try:
+        result = subprocess.run(
+            ["flatpak", "list", "--app", "--columns=application"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return False
+        return app_id in result.stdout
+    except Exception:
+        return False
+
+
+def check_snap_package(name):
+    try:
+        result = subprocess.run(
+            ["snap", "list", name],
+            capture_output=True, text=True, timeout=5
+        )
+        return result.returncode == 0 and name in result.stdout
+    except Exception:
+        return False
+
+
+def _is_live_session():
+    """Prüft zuverlässig, ob wir in einer Live-Session laufen.
+
+    Rückgabe: (bool, str) – True/False und ein Grund-String.
+    """
+    # Prüfung 1: Kernel-Cmdline (Ubuntu/Debian Live)
+    try:
+        with open("/proc/cmdline", "r") as f:
+            cmdline = f.read()
+        if "boot=casper" in cmdline or "boot=live" in cmdline:
+            return True, "Kernel-Cmdline enthält boot=casper oder boot=live"
+    except Exception:
+        pass
+
+    # Prüfung 2: Casper/Overlay-Verzeichnisse
+    for d in ("/run/casper", "/rofs", "/cow"):
+        if os.path.isdir(d):
+            return True, f"Casper/Overlay-Verzeichnis gefunden: {d}"
+
+    # Prüfung 3: Root-Dateisystem-Typ
+    try:
+        result = subprocess.run(
+            ["findmnt", "-n", "-o", "FSTYPE", "/"],
+            capture_output=True, text=True, timeout=3
+        )
+        fstype = result.stdout.strip()
+        if fstype in ("overlay", "squashfs"):
+            return True, f"Root-Dateisystem ist {fstype}"
+    except Exception:
+        pass
+
+    return False, ""
+
+
+def get_real_username():
+    """Nur für Log-/Info-Zwecke in der GUI (CLI nutzt PKEXEC_UID)."""
+    for var in ("SUDO_USER", "USER", "LOGNAME"):
+        val = os.environ.get(var)
+        if val and val != "root":
+            return val
+    uid = os.environ.get("PKEXEC_UID")
+    if uid:
+        try:
+            return pwd.getpwuid(int(uid)).pw_name
+        except Exception:
+            pass
+    try:
+        return pwd.getpwuid(os.stat(os.path.expanduser("~")).st_uid).pw_name
+    except Exception:
+        return ""
+
+
+class UbuntuTransformerWizard(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id='com.ubuntu-transformer.gui')
+        self.games_enabled = False
+        self.office_suite = "libreoffice"
+        self.firewall_enabled = True
+
+        self.brave_installed   = False
+        self.vivaldi_installed = False
+        self.chrome_installed  = False
+        self.firefox_installed = False
+        self.firefox_snap_installed    = False
+        self.firefox_flatpak_installed = False
+
+        self.install_brave   = False
+        self.remove_brave    = False
+        self.install_vivaldi = False
+        self.remove_vivaldi  = False
+        self.install_chrome  = False
+        self.remove_chrome   = False
+        self.install_firefox = False
+        self.remove_firefox  = False
+
+        self.wallpaper_enabled = False
+        self.selected_wallpaper = None
+        self.wallpaper_map = {}
+        self.wallpaper_frames = {}
+        self.wallpaper_check_labels = {}
+        self.wallpaper_flowboxes = []
+        self.wallpaper_populated = False
+        self.wallpaper_scan_running = False
+        self.wallpaper_scan_start_time = None
+
+        self._gallery_tasks = []
+        self._gallery_task_idx = 0
+        self._gallery_path_idx = 0
+        self._gallery_current_flowbox = None
+
+        self.icon_whitesur = True
+        self.icon_minty = False
+        self.icon_we10x = False
+        self.icon_breeze = False
+        self.icon_zorin = False
+        self.icon_moka = False
+        self.icon_numix = False
+        self.icon_pop = False
+        self.icon_papirus = False
+
+        self.default_icon = "whitesur"
+
+        self.current_page = 0
+        self.skip_enabled = True
+        self.vm_checked = False
+        self.log_revealed = False
+        self.installation_done = False
+        self.pulse_timer = None
+
+    def do_activate(self):
+        try:
+            css_provider = Gtk.CssProvider()
+            css_provider.load_from_data(WALLPAPER_CSS)
+            display = Gdk.Display.get_default()
+            if display:
+                Gtk.StyleContext.add_provider_for_display(
+                    display,
+                    css_provider,
+                    Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+                )
+        except Exception as e:
+            print(f"CSS-Provider konnte nicht geladen werden: {e}")
+
+        self.window = Gtk.ApplicationWindow(application=self)
+        self.window.set_title("Ubuntu-PLUS Transformer")
+        self.window.set_default_size(750, 650)
+        self.window.set_resizable(False)
+
+        self.detect_installed_packages()
+
+        # ─────────────────────────────────────────────
+        # Live-System-Erkennung: Vor allen weiteren Schritten
+        # prüfen, ob wir in einer Live-Session laufen.
+        # ─────────────────────────────────────────────
+        is_live, live_reason = _is_live_session()
+        if is_live:
+            self.show_live_warning(live_reason)
+            return
+
+        if not self.vm_checked and self.is_vm():
+            self.vm_checked = True
+            self.show_vm_warning()
+            return
+
+        self.build_ui()
+
+    def detect_installed_packages(self):
+        try:
+            self.brave_installed   = check_flatpak_app("com.brave.Browser")
+            self.vivaldi_installed = check_flatpak_app("com.vivaldi.Vivaldi")
+            self.chrome_installed  = check_flatpak_app("com.google.Chrome")
+
+            self.firefox_snap_installed    = check_snap_package("firefox")
+            self.firefox_flatpak_installed = check_flatpak_app("org.mozilla.firefox")
+            self.firefox_installed = (
+                self.firefox_snap_installed or self.firefox_flatpak_installed
+            )
+        except Exception as e:
+            print(f"Erkennung fehlgeschlagen: {e}")
+
+    def is_vm(self):
+        try:
+            result = subprocess.run(
+                ["systemd-detect-virt"],
+                capture_output=True, text=True
+            )
+            virt_type = result.stdout.strip()
+            return virt_type != "none" and virt_type != ""
+        except Exception:
+            return False
+
+    def show_live_warning(self, reason):
+        dialog = Adw.MessageDialog(
+            transient_for=self.window,
+            modal=True,
+            heading="❌ Live-System erkannt",
+            body=(
+                f"Der Ubuntu-PLUS Transformer kann in einer Live-Session "
+                f"nicht ausgeführt werden.\n\n"
+                f"Grund: {reason}\n\n"
+                f"Das Tool installiert sehr viele Pakete (mehrere hundert MB). "
+                f"In einer Live-Session liegt das Root-Dateisystem vollständig "
+                f"im RAM – das führt zu Speichermangel und bricht mittendrin ab.\n\n"
+                f"Bitte installiere Ubuntu zuerst auf die Festplatte und starte "
+                f"den Transformer dann im installierten System erneut."
+            )
+        )
+        dialog.add_response("quit", "Beenden")
+        dialog.set_default_response("quit")
+        dialog.set_close_response("quit")
+        dialog.connect("response", lambda d, r: self.quit())
+        dialog.present()
+
+    def show_vm_warning(self):
+        dialog = Adw.MessageDialog(
+            transient_for=self.window,
+            modal=True,
+            heading="⚠️ VM erkannt",
+            body=(
+                "Es wurde erkannt, dass das Tool in einer virtuellen Maschine ausgeführt wird.\n\n"
+                "Grafikunterstützung für Spiele (Vulkan/3D) ist in einer VM ohne GPU-Durchreichung oft nicht verfügbar.\n\n"
+                "Möchtest du trotzdem fortfahren?"
+            )
+        )
+        dialog.add_response("cancel", "Abbrechen")
+        dialog.add_response("ok", "Fortfahren")
+        dialog.set_default_response("ok")
+        dialog.set_close_response("cancel")
+        dialog.connect("response", self.on_vm_dialog_response)
+        dialog.present()
+
+    def on_vm_dialog_response(self, dialog, response):
+        dialog.destroy()
+        if response == "cancel":
+            print("❌ Abbruch durch Benutzer.")
+            self.quit()
+        else:
+            self.build_ui()
+
+    def build_ui(self):
+        header = Adw.HeaderBar()
+        header.set_title_widget(Adw.WindowTitle(title="Ubuntu-PLUS Transformer", subtitle="Assistent"))
+        self.window.set_titlebar(header)
+
+        self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.main_box.set_vexpand(True)
+
+        self.page_stack = Gtk.Stack()
+        self.page_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        self.page_stack.set_transition_duration(300)
+
+        self.page_welcome   = self.create_welcome_page()
+        self.page_games     = self.create_games_page()
+        self.page_office    = self.create_office_page()
+        self.page_browser   = self.create_browser_page()
+        self.page_icons     = self.create_icons_page()
+        self.page_wallpaper = self.create_wallpaper_page()
+        self.page_firewall  = self.create_firewall_page()
+        self.page_summary   = self.create_summary_page()
+        self.page_install   = self.create_install_page()
+
+        self.page_stack.add_named(self.page_welcome,   "welcome")
+        self.page_stack.add_named(self.page_games,     "games")
+        self.page_stack.add_named(self.page_office,    "office")
+        self.page_stack.add_named(self.page_browser,   "browser")
+        self.page_stack.add_named(self.page_icons,     "icons")
+        self.page_stack.add_named(self.page_wallpaper, "wallpaper")
+        self.page_stack.add_named(self.page_firewall,  "firewall")
+        self.page_stack.add_named(self.page_summary,   "summary")
+        self.page_stack.add_named(self.page_install,   "install")
+
+        self.page_stack.set_visible_child_name("welcome")
+
+        self.main_box.append(self.page_stack)
+        self.window.set_child(self.main_box)
+        self.window.present()
+
+    # =========================================================
+    # 1. Willkommens-Seite
+    # =========================================================
+    def create_welcome_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+        box.set_margin_top(40)
+        box.set_margin_bottom(40)
+        box.set_margin_start(40)
+        box.set_margin_end(40)
+        box.set_halign(Gtk.Align.CENTER)
+        box.set_valign(Gtk.Align.CENTER)
+
+        title = Gtk.Label()
+        title.set_markup("<span size='x-large' weight='bold'>👋 Hallo!</span>")
+        title.set_halign(Gtk.Align.CENTER)
+        box.append(title)
+
+        desc = Gtk.Label()
+        desc.set_markup(
+            "Du hast gerade das <b>Ubuntu-Transformer</b>-Programm gestartet.\n\n"
+            "Mit diesem Tool kannst du dein Ubuntu zu <b>Ubuntu-PLUS</b> „umbauen“.\n\n"
+            "Wenn du auf <b>„Weiter“</b> klickst, werden dir ein paar Fragen gestellt,\n"
+            "damit das Programm weiß, was du alles in deinem System haben möchtest.\n\n"
+            "<span foreground='red'><b>⚠️ Achtung:</b></span>\n"
+            "Wenn du später auf <b>„Jetzt anwenden“</b> klickst, werden tiefgreifende\n"
+            "Veränderungen am System vorgenommen.\n\n"
+            "Es werden Programme installiert bzw. deinstalliert,\n"
+            "neue Icon-Sets, Themes, Avatare und Wallpaper hinzugefügt\n"
+            "und vieles mehr.\n"
+            "⚠️ ⚠️ BITTE MACH VOR DEM START EIN BACKUP VON DEINEM SYSTEM.⚠️ ⚠️"
+        )
+        desc.set_wrap(True)
+        desc.set_halign(Gtk.Align.CENTER)
+        desc.set_justify(Gtk.Justification.CENTER)
+        box.append(desc)
+
+        button_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        button_row.set_halign(Gtk.Align.CENTER)
+
+        info_button = Gtk.Button(label="ℹ️ Mehr Informationen")
+        info_button.connect("clicked", self.on_info_clicked)
+        button_row.append(info_button)
+
+        donate_button = Gtk.Button(label="☕ Unterstützen")
+        donate_button.add_css_class("suggested-action")
+        donate_button.set_tooltip_text(
+            "Unterstütze die Entwicklung des Ubuntu-PLUS Transformers\n"
+            "über Ko-fi: https://ko-fi.com/evilware666"
+        )
+        donate_button.connect("clicked", self.on_donate_clicked)
+        button_row.append(donate_button)
+
+        box.append(button_row)
+
+        next_button = Gtk.Button(label="Weiter →")
+        next_button.add_css_class("suggested-action")
+        next_button.set_halign(Gtk.Align.CENTER)
+        next_button.set_margin_top(20)
+        next_button.connect("clicked", self.on_next_clicked)
+        box.append(next_button)
+
+        return box
+
+    def on_info_clicked(self, button):
+        dialog = Gtk.MessageDialog(
+            transient_for=self.window,
+            modal=True,
+            text="ℹ️ Was passiert bei der Installation?",
+            secondary_text=(
+                "Das Ubuntu-Transformer-Tool führt folgende Änderungen durch:\n\n"
+                "• Systemaktualisierung und Treiber-Installation\n"
+                "• Aktivierung der 32-Bit-Architektur (für Gaming)\n"
+                "• Installation von Gaming-Tools (Steam, Lutris, Heroic, ProtonUp-Qt, Protontricks, Faugus)\n"
+                "• Installation einer Büro-Software nach Wahl\n"
+                "  (LibreOffice, ONLYOFFICE Desktop Editors oder AbiWord + Gnumeric)\n"
+                "• Installation zusätzlicher Browser als Flatpak nach Wahl\n"
+                "  (Brave, Vivaldi, Google Chrome)\n"
+                "• Firefox installieren (Snap mit Flatpak-Fallback) oder entfernen\n"
+                "• Auswahl eines Hintergrundbildes (optional)\n"
+                "• Einrichtung der Firewall (UFW)\n"
+                "• Austausch von Avataren, Wallpapern und Icon-Themes\n"
+                "• Anpassung des GNOME-Desktops (Dock, Nautilus, Layout)\n"
+                "• Wiederherstellung deines Desktop-Backups (falls vorhanden)\n\n"
+                "Alle Änderungen sind für Einsteiger optimiert und können später\n"
+                "jederzeit manuell angepasst werden."
+            )
+        )
+        dialog.add_button("OK", Gtk.ResponseType.OK)
+        dialog.connect("response", lambda d, r: d.destroy())
+        dialog.present()
+
+    def on_donate_clicked(self, button):
+        url = "https://ko-fi.com/evilware666"
+        try:
+            webbrowser.open(url)
+        except Exception:
+            try:
+                subprocess.run(["xdg-open", url], check=False)
+            except Exception as e:
+                self.show_message_dialog(
+                    "Spenden-Link",
+                    f"Bitte öffne die Seite manuell:\n\n{url}\n\n({e})",
+                    is_error=False
+                )
+
+    # =========================================================
+    # 2. Spiele-Seite
+    # =========================================================
+    def create_games_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+        box.set_margin_top(40)
+        box.set_margin_bottom(40)
+        box.set_margin_start(40)
+        box.set_margin_end(40)
+        box.set_halign(Gtk.Align.CENTER)
+        box.set_valign(Gtk.Align.CENTER)
+
+        title = Gtk.Label()
+        title.set_markup("<span size='x-large' weight='bold'>🎮 Spiele-Unterstützung</span>")
+        title.set_halign(Gtk.Align.CENTER)
+        box.append(title)
+
+        desc = Gtk.Label()
+        desc.set_markup(
+            "Möchtest du Spiele auf deinem System spielen?\n\n"
+            "Wenn du diese Option aktivierst, werden folgende Tools installiert:\n\n"
+            "• <b>Steam</b> – Die größte Spieleplattform für Linux\n"
+            "• <b>Lutris</b> – Spiele-Plattform für alle Spiele-Plattformen\n"
+            "• <b>Heroic Games Launcher</b> – Epic Games &amp; GOG-Spiele\n"
+            "• <b>ProtonUp-Qt</b> – Verwaltung von Proton-Versionen\n"
+            "• <b>Protontricks</b> – Winetricks für Steam/Proton\n"
+            "• <b>Faugus Launcher</b> – Alternativer Spiele-Launcher\n\n"
+            "<span foreground='#3584e4'>💡 Tipp:</span> Auch wenn du keine Spiele spielst,\n"
+            "können diese Tools später nützlich sein."
+        )
+        desc.set_wrap(True)
+        desc.set_halign(Gtk.Align.CENTER)
+        desc.set_justify(Gtk.Justification.CENTER)
+        box.append(desc)
+
+        self.games_check = Gtk.CheckButton(label="✅ Spiele-Unterstützung aktivieren")
+        self.games_check.set_active(self.games_enabled)
+        self.games_check.set_halign(Gtk.Align.CENTER)
+        self.games_check.connect("toggled", self.on_games_toggled)
+        box.append(self.games_check)
+
+        nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        nav_box.set_halign(Gtk.Align.FILL)
+        nav_box.set_margin_top(30)
+
+        back_button = Gtk.Button(label="← Zurück")
+        back_button.connect("clicked", self.on_back_clicked)
+        nav_box.append(back_button)
+
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        nav_box.append(spacer)
+
+        next_button = Gtk.Button(label="Weiter →")
+        next_button.add_css_class("suggested-action")
+        next_button.connect("clicked", self.on_next_clicked)
+        nav_box.append(next_button)
+
+        self.skip_button_games = Gtk.Button(label="⏭️ Auswahl-Manager überspringen")
+        self.skip_button_games.set_sensitive(True)
+        self.skip_button_games.set_tooltip_text("Überspringt die Auswahl und verwendet die Standard-Einstellungen.")
+        self.skip_button_games.add_css_class("destructive-action")
+        self.skip_button_games.connect("clicked", self.on_skip_clicked)
+        nav_box.append(self.skip_button_games)
+
+        box.append(nav_box)
+        return box
+
+    def on_games_toggled(self, button):
+        self.games_enabled = button.get_active()
+
+    # =========================================================
+    # 3. Büro-Seite
+    # =========================================================
+    def create_office_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+        box.set_margin_top(40)
+        box.set_margin_bottom(40)
+        box.set_margin_start(40)
+        box.set_margin_end(40)
+        box.set_halign(Gtk.Align.CENTER)
+        box.set_valign(Gtk.Align.CENTER)
+
+        title = Gtk.Label()
+        title.set_markup("<span size='x-large' weight='bold'>📄 Büro-Software</span>")
+        title.set_halign(Gtk.Align.CENTER)
+        box.append(title)
+
+        desc = Gtk.Label()
+        desc.set_markup(
+            "Welche Büro-Software möchtest du auf deinem System haben?\n\n"
+            "• <b>LibreOffice</b> – Umfangreiche, kostenlose Office-Suite\n"
+            "  (Writer, Calc, Impress, Draw, Base, Math) – Standard\n"
+            "• <b>ONLYOFFICE Desktop Editors</b> – Sehr gute Kompatibilität\n"
+            "  mit Microsoft-Office-Formaten (.docx, .xlsx, .pptx) – als Flatpak\n"
+            "• <b>AbiWord + Gnumeric</b> – Leichtgewichtige Textverarbeitung\n"
+            "  und Tabellenkalkulation (ideal für ältere Hardware)\n"
+            "• <b>Keine Büro-Software</b> – nichts installieren\n\n"
+            "<span foreground='#159AFA'>💡 Tipp:</span> Wenn du Dateien mit Windows-Nutzern\n"
+            "austauschst, sind LibreOffice und ONLYOFFICE die beste Wahl."
+        )
+        desc.set_wrap(True)
+        desc.set_halign(Gtk.Align.CENTER)
+        desc.set_justify(Gtk.Justification.CENTER)
+        box.append(desc)
+
+        radio_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        radio_box.set_halign(Gtk.Align.CENTER)
+        radio_box.set_margin_top(10)
+
+        self.office_radio_libre = Gtk.CheckButton(label="LibreOffice (ℹ️ Standard Installation)")
+        self.office_radio_libre.set_active(self.office_suite == "libreoffice")
+        self.office_radio_libre.set_tooltip_text("Umfangreiche Office-Suite – Standard in Ubuntu-PLUS")
+        radio_box.append(self.office_radio_libre)
+
+        self.office_radio_only = Gtk.CheckButton(label="ONLYOFFICE Desktop Editors")
+        self.office_radio_only.set_group(self.office_radio_libre)
+        self.office_radio_only.set_active(self.office_suite == "onlyoffice")
+        self.office_radio_only.set_tooltip_text("Beste Kompatibilität mit Microsoft-Office-Formaten – als Flatpak")
+        radio_box.append(self.office_radio_only)
+
+        self.office_radio_abiword = Gtk.CheckButton(label="AbiWord + Gnumeric (leichtgewichtig)")
+        self.office_radio_abiword.set_group(self.office_radio_libre)
+        self.office_radio_abiword.set_active(self.office_suite == "abiword")
+        self.office_radio_abiword.set_tooltip_text("Schlanke Textverarbeitung + Tabellenkalkulation")
+        radio_box.append(self.office_radio_abiword)
+
+        self.office_radio_none = Gtk.CheckButton(label="Keine Büro-Software installieren")
+        self.office_radio_none.set_group(self.office_radio_libre)
+        self.office_radio_none.set_active(self.office_suite == "none")
+        self.office_radio_none.set_tooltip_text("Es wird keine Büro-Software installiert.")
+        radio_box.append(self.office_radio_none)
+
+        box.append(radio_box)
+
+        hint = Gtk.Label()
+        hint.set_markup(
+            "<span foreground='#159AFA'>ℹ️ Hinweis:</span> AbiWord ist in manchen "
+            "Ubuntu-Versionen nicht mehr im offiziellen Repo verfügbar, in diesem Fall "
+            "wird das Flatpak-Paket installiert. ONLYOFFICE wird grundsätzlich als Flatpak "
+            "installiert."
+        )
+        hint.set_wrap(True)
+        hint.set_halign(Gtk.Align.CENTER)
+        hint.set_justify(Gtk.Justification.CENTER)
+        hint.set_margin_top(10)
+        box.append(hint)
+
+        nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        nav_box.set_halign(Gtk.Align.FILL)
+        nav_box.set_margin_top(30)
+
+        back_button = Gtk.Button(label="← Zurück")
+        back_button.connect("clicked", self.on_back_clicked)
+        nav_box.append(back_button)
+
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        nav_box.append(spacer)
+
+        next_button = Gtk.Button(label="Weiter →")
+        next_button.add_css_class("suggested-action")
+        next_button.connect("clicked", self.on_next_clicked)
+        nav_box.append(next_button)
+
+        self.skip_button_office = Gtk.Button(label="⏭️ Auswahl-Manager überspringen")
+        self.skip_button_office.set_sensitive(True)
+        self.skip_button_office.set_tooltip_text("Überspringt die Auswahl und verwendet die Standard-Einstellungen.")
+        self.skip_button_office.add_css_class("destructive-action")
+        self.skip_button_office.connect("clicked", self.on_skip_clicked)
+        nav_box.append(self.skip_button_office)
+
+        box.append(nav_box)
+        return box
+
+    def get_selected_office_suite(self):
+        if self.office_radio_only.get_active():
+            return "onlyoffice"
+        if self.office_radio_abiword.get_active():
+            return "abiword"
+        if self.office_radio_none.get_active():
+            return "none"
+        return "libreoffice"
+
+    # =========================================================
+    # 3b. Browser-Seite
+    # =========================================================
+    def _make_status_label(self):
+        lbl = Gtk.Label()
+        lbl.set_halign(Gtk.Align.START)
+        lbl.set_xalign(0.0)
+        return lbl
+
+    def _update_browser_status(self, installed, checkbox, label):
+        checked = checkbox.get_active()
+        if installed and checked:
+            label.set_markup(
+                f"<span foreground='{COLOR_REMOVE}' weight='bold'>🗑️ wird deinstalliert</span>"
+            )
+        elif installed:
+            label.set_markup(
+                f"<span foreground='{COLOR_INSTALLED}' weight='bold'>✅ installiert</span>"
+            )
+        elif checked:
+            label.set_markup(
+                f"<span foreground='{COLOR_INSTALLED}' weight='bold'>⬇️ wird installiert</span>"
+            )
+        else:
+            label.set_markup(
+                f"<span foreground='{COLOR_NOT_INSTALLED}'>– nicht installiert</span>"
+            )
+
+    def create_browser_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+        box.set_margin_top(40)
+        box.set_margin_bottom(40)
+        box.set_margin_start(40)
+        box.set_margin_end(40)
+        box.set_halign(Gtk.Align.CENTER)
+        box.set_valign(Gtk.Align.CENTER)
+
+        title = Gtk.Label()
+        title.set_markup("<span size='x-large' weight='bold'>🌐 Browser-Auswahl</span>")
+        title.set_halign(Gtk.Align.CENTER)
+        box.append(title)
+
+        desc = Gtk.Label()
+        desc.set_markup(
+            "Möchtest du zusätzliche Browser installieren?\n\n"
+            "Du kannst <b>mehrere</b> auswählen.\n\n"
+            "<span foreground='#2ec27e' weight='bold'>✅ installiert</span> · "
+            "<span foreground='#2ec27e' weight='bold'>⬇️ wird installiert</span> · "
+            "<span foreground='#e01b24' weight='bold'>🗑️ wird deinstalliert</span> · "
+            "<span foreground='#9a9996'>– nicht installiert</span>"
+        )
+        desc.set_wrap(True)
+        desc.set_halign(Gtk.Align.CENTER)
+        desc.set_justify(Gtk.Justification.CENTER)
+        box.append(desc)
+
+        grid = Gtk.Grid()
+        grid.set_column_spacing(15)
+        grid.set_row_spacing(15)
+        grid.set_halign(Gtk.Align.CENTER)
+        grid.set_margin_top(15)
+
+        self.brave_check = Gtk.CheckButton(label="🦁 Brave")
+        self.brave_check.set_active(False)
+        self.brave_check.set_tooltip_text(
+            "Datenschutzfokussierter Chromium-Browser mit integriertem\n"
+            "Adblocker, Tracking-Schutz und BAT-Belohnungssystem."
+        )
+        grid.attach(self.brave_check, 0, 0, 1, 1)
+
+        self.brave_status_lbl = self._make_status_label()
+        grid.attach(self.brave_status_lbl, 1, 0, 1, 1)
+
+        brave_desc = Gtk.Label()
+        brave_desc.set_markup(
+            "<small><i>Blockiert Werbung &amp; Tracker standardmäßig, "
+            "sehr schnell, basiert auf Chromium.</i></small>"
+        )
+        brave_desc.set_halign(Gtk.Align.START)
+        grid.attach(brave_desc, 2, 0, 1, 1)
+
+        self.vivaldi_check = Gtk.CheckButton(label="🎭 Vivaldi")
+        self.vivaldi_check.set_active(False)
+        self.vivaldi_check.set_tooltip_text(
+            "Hochgradig anpassbarer Browser mit Tab-Stapeln, Split-Screen,\n"
+            "integriertem E-Mail-Client, Kalender und Notizen."
+        )
+        grid.attach(self.vivaldi_check, 0, 1, 1, 1)
+
+        self.vivaldi_status_lbl = self._make_status_label()
+        grid.attach(self.vivaldi_status_lbl, 1, 1, 1, 1)
+
+        vivaldi_desc = Gtk.Label()
+        vivaldi_desc.set_markup(
+            "<small><i>Extrem anpassbar, viele eingebaute Werkzeuge, "
+            "aus Norwegen (ehem. Opera-Entwickler).</i></small>"
+        )
+        vivaldi_desc.set_halign(Gtk.Align.START)
+        grid.attach(vivaldi_desc, 2, 1, 1, 1)
+
+        self.chrome_check = Gtk.CheckButton(label="🌍 Google Chrome")
+        self.chrome_check.set_active(False)
+        self.chrome_check.set_tooltip_text(
+            "Googles offizieller Browser – beste Kompatibilität mit\n"
+            "Webseiten und Google-Diensten."
+        )
+        grid.attach(self.chrome_check, 0, 2, 1, 1)
+
+        self.chrome_status_lbl = self._make_status_label()
+        grid.attach(self.chrome_status_lbl, 1, 2, 1, 1)
+
+        chrome_desc = Gtk.Label()
+        chrome_desc.set_markup(
+            "<small><i>Der meistgenutzte Browser, synct mit Google-Konto. "
+            "Flatpak-Version ist Community-gepflegt.</i></small>"
+        )
+        chrome_desc.set_halign(Gtk.Align.START)
+        grid.attach(chrome_desc, 2, 2, 1, 1)
+
+        self.firefox_check = Gtk.CheckButton(label="🔥 Firefox")
+        self.firefox_check.set_active(False)
+        self.firefox_check.set_tooltip_text(
+            "Mozilla Firefox – wird auf Ubuntu als Snap installiert.\n"
+            "Falls Snap nicht verfügbar ist, wird automatisch die Flatpak-Version\n"
+            "(org.mozilla.firefox) installiert."
+        )
+        grid.attach(self.firefox_check, 0, 3, 1, 1)
+
+        self.firefox_status_lbl = self._make_status_label()
+        grid.attach(self.firefox_status_lbl, 1, 3, 1, 1)
+
+        firefox_desc = Gtk.Label()
+        firefox_desc.set_markup(
+            "<small><i>Mozilla Firefox - Der Klassiker unter den Open-Source Browsern.</i></small>"
+        )
+        firefox_desc.set_halign(Gtk.Align.START)
+        grid.attach(firefox_desc, 2, 3, 1, 1)
+
+        box.append(grid)
+
+        self.brave_check.connect(
+            "toggled",
+            lambda c: self._update_browser_status(self.brave_installed, c, self.brave_status_lbl)
+        )
+        self.vivaldi_check.connect(
+            "toggled",
+            lambda c: self._update_browser_status(self.vivaldi_installed, c, self.vivaldi_status_lbl)
+        )
+        self.chrome_check.connect(
+            "toggled",
+            lambda c: self._update_browser_status(self.chrome_installed, c, self.chrome_status_lbl)
+        )
+        self.firefox_check.connect(
+            "toggled",
+            lambda c: self._update_browser_status(self.firefox_installed, c, self.firefox_status_lbl)
+        )
+
+        self._update_browser_status(self.brave_installed,   self.brave_check,   self.brave_status_lbl)
+        self._update_browser_status(self.vivaldi_installed, self.vivaldi_check, self.vivaldi_status_lbl)
+        self._update_browser_status(self.chrome_installed,  self.chrome_check,  self.chrome_status_lbl)
+        self._update_browser_status(self.firefox_installed, self.firefox_check, self.firefox_status_lbl)
+
+        hint = Gtk.Label()
+        hint.set_markup(
+            "<span foreground='#159AFA'>ℹ️ Hinweis:</span> Firefox wird unter Ubuntu "
+            "bevorzugt als <b>Snap</b> installiert. Ist Snap nicht verfügbar (z. B. weil "
+            "snapd entfernt wurde), wird automatisch die <b>Flatpak</b>-Version verwendet. "
+            "Beim Entfernen werden sowohl Snap- als auch Flatpak-Version deinstalliert."
+        )
+        hint.set_wrap(True)
+        hint.set_halign(Gtk.Align.CENTER)
+        hint.set_justify(Gtk.Justification.CENTER)
+        hint.set_margin_top(15)
+        box.append(hint)
+
+        nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        nav_box.set_halign(Gtk.Align.FILL)
+        nav_box.set_margin_top(30)
+
+        back_button = Gtk.Button(label="← Zurück")
+        back_button.connect("clicked", self.on_back_clicked)
+        nav_box.append(back_button)
+
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        nav_box.append(spacer)
+
+        next_button = Gtk.Button(label="Weiter →")
+        next_button.add_css_class("suggested-action")
+        next_button.connect("clicked", self.on_next_clicked)
+        nav_box.append(next_button)
+
+        self.skip_button_browser = Gtk.Button(label="⏭️ Auswahl-Manager überspringen")
+        self.skip_button_browser.set_sensitive(True)
+        self.skip_button_browser.set_tooltip_text("Überspringt die Auswahl und verwendet die Standard-Einstellungen.")
+        self.skip_button_browser.add_css_class("destructive-action")
+        self.skip_button_browser.connect("clicked", self.on_skip_clicked)
+        nav_box.append(self.skip_button_browser)
+
+        box.append(nav_box)
+        return box
+
+    # =========================================================
+    # 4. Icon-Auswahl-Seite
+    # =========================================================
+    def create_icons_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+        box.set_margin_top(40)
+        box.set_margin_bottom(40)
+        box.set_margin_start(40)
+        box.set_margin_end(40)
+        box.set_halign(Gtk.Align.CENTER)
+        box.set_valign(Gtk.Align.CENTER)
+
+        title = Gtk.Label()
+        title.set_markup("<span size='x-large' weight='bold'>🎨 Icon‑Sets</span>")
+        title.set_halign(Gtk.Align.CENTER)
+        box.append(title)
+
+        desc = Gtk.Label()
+        desc.set_markup(
+            "Wähle aus, welche Icon‑Sets installiert werden sollen\n"
+            "und welches davon als Standard verwendet wird.\n\n"
+            "<b>Installierte Icon‑Sets (Checkboxen):</b>\n"
+            "• <b>WhiteSur</b> – Modernes, abgerundetes Design (Standard)\n"
+            "• <b>Mint‑Y</b> – Frische Farben, abgerundete Ecken\n"
+            "• <b>We10X</b> – Windows‑ähnliches Icon‑Set\n"
+            "• <b>Breeze</b> – KDE‑Standard, klare Kanten\n"
+            "• <b>ZorinOS</b> – Elegant, professionell\n"
+            "• <b>Moka</b> – Modern, farbenfroh\n"
+            "• <b>Numix</b> – Modernes, minimales Design\n"
+            "• <b>Pop</b> – Modern, kräftige Farben (System76)\n"
+            "• <b>Papirus</b> – Modernes, farbenfrohes Icon‑Set mit vielen Alternativen\n"
+            "• <b>Yaru</b> – Ubuntu‑Standard, immer verfügbar (nur als Standard wählbar)\n\n"
+            "<span foreground='#159AFA'>💡 Tipp:</span> Wähle ein Icon‑Set, das dir optisch am besten gefällt.\n"
+            "Du kannst später jederzeit in den GNOME‑Einstellungen wechseln."
+        )
+        desc.set_wrap(True)
+        desc.set_halign(Gtk.Align.CENTER)
+        desc.set_justify(Gtk.Justification.CENTER)
+        box.append(desc)
+
+        icon_grid = Gtk.Grid()
+        icon_grid.set_column_spacing(20)
+        icon_grid.set_row_spacing(10)
+        icon_grid.set_halign(Gtk.Align.CENTER)
+        icon_grid.set_margin_top(10)
+
+        self.icon_whitesur_chk = Gtk.CheckButton(label="WhiteSur")
+        self.icon_whitesur_chk.set_active(self.icon_whitesur)
+        self.icon_whitesur_chk.set_tooltip_text("Modernes, abgerundetes Design – Standard im Ubuntu-Transformer")
+        icon_grid.attach(self.icon_whitesur_chk, 0, 0, 1, 1)
+
+        self.icon_minty_chk = Gtk.CheckButton(label="Mint‑Y")
+        self.icon_minty_chk.set_active(self.icon_minty)
+        self.icon_minty_chk.set_tooltip_text("Frische Farben, abgerundete Ecken – aus Linux Mint")
+        icon_grid.attach(self.icon_minty_chk, 0, 1, 1, 1)
+
+        self.icon_we10x_chk = Gtk.CheckButton(label="We10X")
+        self.icon_we10x_chk.set_active(self.icon_we10x)
+        self.icon_we10x_chk.set_tooltip_text("Windows‑ähnliches Icon‑Set mit klaren Farben")
+        icon_grid.attach(self.icon_we10x_chk, 0, 2, 1, 1)
+
+        self.icon_breeze_chk = Gtk.CheckButton(label="Breeze")
+        self.icon_breeze_chk.set_active(self.icon_breeze)
+        self.icon_breeze_chk.set_tooltip_text("KDE‑Standard – klare, minimalistische Icons")
+        icon_grid.attach(self.icon_breeze_chk, 0, 3, 1, 1)
+
+        self.icon_zorin_chk = Gtk.CheckButton(label="ZorinOS")
+        self.icon_zorin_chk.set_active(self.icon_zorin)
+        self.icon_zorin_chk.set_tooltip_text("Elegantes, professionelles Design aus Zorin OS")
+        icon_grid.attach(self.icon_zorin_chk, 1, 0, 1, 1)
+
+        self.icon_moka_chk = Gtk.CheckButton(label="Moka")
+        self.icon_moka_chk.set_active(self.icon_moka)
+        self.icon_moka_chk.set_tooltip_text("Modernes, farbenfrohes Icon‑Set")
+        icon_grid.attach(self.icon_moka_chk, 1, 1, 1, 1)
+
+        self.icon_numix_chk = Gtk.CheckButton(label="Numix")
+        self.icon_numix_chk.set_active(self.icon_numix)
+        self.icon_numix_chk.set_tooltip_text("Modernes, minimales Design mit klaren Farben")
+        icon_grid.attach(self.icon_numix_chk, 1, 2, 1, 1)
+
+        self.icon_pop_chk = Gtk.CheckButton(label="Pop")
+        self.icon_pop_chk.set_active(self.icon_pop)
+        self.icon_pop_chk.set_tooltip_text("Modernes Icon‑Set mit kräftigen Farben (System76)")
+        icon_grid.attach(self.icon_pop_chk, 1, 3, 1, 1)
+
+        self.icon_papirus_chk = Gtk.CheckButton(label="Papirus")
+        self.icon_papirus_chk.set_active(self.icon_papirus)
+        self.icon_papirus_chk.set_tooltip_text("Modernes, farbenfrohes Icon‑Set mit vielen Alternativen")
+        icon_grid.attach(self.icon_papirus_chk, 2, 0, 1, 1)
+
+        box.append(icon_grid)
+
+        hint = Gtk.Label()
+        hint.set_markup(
+            "<span foreground='#159AFA'>ℹ️ Hinweis:</span> Wenn du ein Icon-Set als Standard wählst, "
+            "wird es automatisch zur Installation ausgewählt."
+        )
+        hint.set_halign(Gtk.Align.CENTER)
+        hint.set_wrap(True)
+        hint.set_margin_top(15)
+        box.append(hint)
+
+        radio_label = Gtk.Label()
+        radio_label.set_markup("<b>Welches Icon‑Set soll als Standard verwendet werden?</b>")
+        radio_label.set_halign(Gtk.Align.CENTER)
+        radio_label.set_margin_top(15)
+        box.append(radio_label)
+
+        radio_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        radio_box.set_halign(Gtk.Align.CENTER)
+        radio_box.set_margin_top(5)
+
+        self.radio_whitesur = Gtk.CheckButton(label="WhiteSur")
+        self.radio_whitesur.set_active(self.default_icon == "whitesur")
+        self.radio_whitesur.set_group(None)
+        radio_box.append(self.radio_whitesur)
+
+        self.radio_minty = Gtk.CheckButton(label="Mint‑Y")
+        self.radio_minty.set_active(self.default_icon == "minty")
+        self.radio_minty.set_group(self.radio_whitesur)
+        radio_box.append(self.radio_minty)
+
+        self.radio_we10x = Gtk.CheckButton(label="We10X")
+        self.radio_we10x.set_active(self.default_icon == "we10x")
+        self.radio_we10x.set_group(self.radio_whitesur)
+        radio_box.append(self.radio_we10x)
+
+        self.radio_breeze = Gtk.CheckButton(label="Breeze")
+        self.radio_breeze.set_active(self.default_icon == "breeze")
+        self.radio_breeze.set_group(self.radio_whitesur)
+        radio_box.append(self.radio_breeze)
+
+        self.radio_zorin = Gtk.CheckButton(label="ZorinOS")
+        self.radio_zorin.set_active(self.default_icon == "zorin")
+        self.radio_zorin.set_group(self.radio_whitesur)
+        radio_box.append(self.radio_zorin)
+
+        self.radio_moka = Gtk.CheckButton(label="Moka")
+        self.radio_moka.set_active(self.default_icon == "moka")
+        self.radio_moka.set_group(self.radio_whitesur)
+        radio_box.append(self.radio_moka)
+
+        self.radio_numix = Gtk.CheckButton(label="Numix")
+        self.radio_numix.set_active(self.default_icon == "numix")
+        self.radio_numix.set_group(self.radio_whitesur)
+        radio_box.append(self.radio_numix)
+
+        self.radio_pop = Gtk.CheckButton(label="Pop")
+        self.radio_pop.set_active(self.default_icon == "pop")
+        self.radio_pop.set_group(self.radio_whitesur)
+        radio_box.append(self.radio_pop)
+
+        self.radio_papirus = Gtk.CheckButton(label="Papirus")
+        self.radio_papirus.set_active(self.default_icon == "papirus")
+        self.radio_papirus.set_group(self.radio_whitesur)
+        radio_box.append(self.radio_papirus)
+
+        self.radio_yaru = Gtk.CheckButton(label="Yaru (Ubuntu‑Standard)")
+        self.radio_yaru.set_active(self.default_icon == "yaru")
+        self.radio_yaru.set_group(self.radio_whitesur)
+        self.radio_yaru.set_tooltip_text("Yaru ist das Standard‑Icon‑Set von Ubuntu – immer verfügbar.")
+        radio_box.append(self.radio_yaru)
+
+        box.append(radio_box)
+
+        _auto_state = {"last": None}
+
+        def _sync_default_to_install(radio, chk, icon_key):
+            if not radio.get_active():
+                return
+            prev = _auto_state["last"]
+            if prev and prev != icon_key:
+                prev_chk = getattr(self, f'icon_{prev}_chk', None)
+                if prev_chk is not None and prev_chk.get_active():
+                    prev_chk.set_active(False)
+            if chk is not None and not chk.get_active():
+                chk.set_active(True)
+            _auto_state["last"] = icon_key
+
+        self.radio_whitesur.connect("toggled", lambda r: _sync_default_to_install(r, self.icon_whitesur_chk, "whitesur"))
+        self.radio_minty.connect("toggled",    lambda r: _sync_default_to_install(r, self.icon_minty_chk,    "minty"))
+        self.radio_we10x.connect("toggled",    lambda r: _sync_default_to_install(r, self.icon_we10x_chk,    "we10x"))
+        self.radio_breeze.connect("toggled",   lambda r: _sync_default_to_install(r, self.icon_breeze_chk,   "breeze"))
+        self.radio_zorin.connect("toggled",    lambda r: _sync_default_to_install(r, self.icon_zorin_chk,    "zorin"))
+        self.radio_moka.connect("toggled",     lambda r: _sync_default_to_install(r, self.icon_moka_chk,     "moka"))
+        self.radio_numix.connect("toggled",    lambda r: _sync_default_to_install(r, self.icon_numix_chk,    "numix"))
+        self.radio_pop.connect("toggled",      lambda r: _sync_default_to_install(r, self.icon_pop_chk,      "pop"))
+        self.radio_papirus.connect("toggled",  lambda r: _sync_default_to_install(r, self.icon_papirus_chk,  "papirus"))
+        self.radio_yaru.connect("toggled",     lambda r: _sync_default_to_install(r, None,                    "yaru"))
+
+        def _check_uncheck_default(chk, radio):
+            if not chk.get_active() and radio.get_active():
+                if radio == self.radio_yaru:
+                    return
+                dialog = Gtk.MessageDialog(
+                    transient_for=self.window,
+                    modal=True,
+                    text="⚠️ Standard-Icon nicht zur Installation ausgewählt!",
+                    secondary_text=(
+                        f"Du hast „{radio.get_label()}“ als Standard-Icon-Set gewählt,\n"
+                        f"aber „{chk.get_label()}“ ist nicht zur Installation ausgewählt.\n\n"
+                        "Das Icon-Set wird nach der Installation NICHT verfügbar sein,\n"
+                        "und dein System wird auf das Standard-Theme zurückfallen.\n\n"
+                        "Möchtest du es automatisch mit installieren?"
+                    )
+                )
+                dialog.add_button("❌ Nein, nicht installieren", Gtk.ResponseType.NO)
+                install_btn = dialog.add_button("✅ Ja, mit installieren", Gtk.ResponseType.YES)
+                install_btn.add_css_class("suggested-action")
+
+                def _on_response(d, resp):
+                    d.destroy()
+                    if resp == Gtk.ResponseType.YES:
+                        chk.set_active(True)
+
+                dialog.connect("response", _on_response)
+                dialog.present()
+
+        self.icon_whitesur_chk.connect("toggled", lambda c: _check_uncheck_default(c, self.radio_whitesur))
+        self.icon_minty_chk.connect("toggled",    lambda c: _check_uncheck_default(c, self.radio_minty))
+        self.icon_we10x_chk.connect("toggled",    lambda c: _check_uncheck_default(c, self.radio_we10x))
+        self.icon_breeze_chk.connect("toggled",   lambda c: _check_uncheck_default(c, self.radio_breeze))
+        self.icon_zorin_chk.connect("toggled",    lambda c: _check_uncheck_default(c, self.radio_zorin))
+        self.icon_moka_chk.connect("toggled",     lambda c: _check_uncheck_default(c, self.radio_moka))
+        self.icon_numix_chk.connect("toggled",    lambda c: _check_uncheck_default(c, self.radio_numix))
+        self.icon_pop_chk.connect("toggled",      lambda c: _check_uncheck_default(c, self.radio_pop))
+        self.icon_papirus_chk.connect("toggled",  lambda c: _check_uncheck_default(c, self.radio_papirus))
+
+        nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        nav_box.set_halign(Gtk.Align.FILL)
+        nav_box.set_margin_top(30)
+
+        back_button = Gtk.Button(label="← Zurück")
+        back_button.connect("clicked", self.on_back_clicked)
+        nav_box.append(back_button)
+
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        nav_box.append(spacer)
+
+        next_button = Gtk.Button(label="Weiter →")
+        next_button.add_css_class("suggested-action")
+        next_button.connect("clicked", self.on_next_clicked)
+        nav_box.append(next_button)
+
+        self.skip_button_icons = Gtk.Button(label="⏭️ Auswahl-Manager überspringen")
+        self.skip_button_icons.set_sensitive(True)
+        self.skip_button_icons.set_tooltip_text("Überspringt die Auswahl und verwendet die Standard-Einstellungen.")
+        self.skip_button_icons.add_css_class("destructive-action")
+        self.skip_button_icons.connect("clicked", self.on_skip_clicked)
+        nav_box.append(self.skip_button_icons)
+
+        box.append(nav_box)
+        return box
+
+    # =========================================================
+    # 4b. Wallpaper-Seite
+    # =========================================================
+    def create_wallpaper_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_margin_top(30)
+        box.set_margin_bottom(30)
+        box.set_margin_start(30)
+        box.set_margin_end(30)
+
+        title = Gtk.Label()
+        title.set_markup("<span size='x-large' weight='bold'>🖼️ Hintergrundbild</span>")
+        title.set_halign(Gtk.Align.CENTER)
+        box.append(title)
+
+        desc = Gtk.Label()
+        desc.set_markup(
+            "Möchtest du ein Hintergrundbild auswählen?\n\n"
+            "Standardmäßig wird das Ubuntu-PLUS Wallpaper genommen.\n\n"
+            "Aktiviere die Option unten, um ein anderes Bild auszuwählen.\n"
+            "Zur Verfügung stehen Ubuntu-Standard-Wallpaper, Ubuntu-PLUS-Wallpaper,\n"
+            "Extra Wallpaper von "
+            "<a href='https://pixabay.com/de/users/bjarstin-52095640/</a>, "
+            "sowie deine <b>eigenen Bilder</b> aus <tt>~/Bilder</tt>.\n\n"
+            "<span foreground='#e01b24'><i>ℹ️ Tipp: Doppelklick auf ein Bild öffnet eine große Vorschau.</i></span>"
+        )
+        desc.set_wrap(True)
+        desc.set_halign(Gtk.Align.CENTER)
+        desc.set_justify(Gtk.Justification.CENTER)
+        desc.set_use_markup(True)
+        desc.set_selectable(False)
+        desc.connect("activate-link", self.on_wallpaper_link_activated)
+        box.append(desc)
+
+        self.wallpaper_enabled_check = Gtk.CheckButton(label="🎨 Extra Wallpaper wählen")
+        self.wallpaper_enabled_check.set_active(False)
+        self.wallpaper_enabled_check.set_halign(Gtk.Align.CENTER)
+        self.wallpaper_enabled_check.set_margin_top(10)
+        self.wallpaper_enabled_check.set_tooltip_text(
+            "Wenn aktiviert, kannst du ein anderes Hintergrundbild auswählen.\n"
+            "Wenn deaktiviert, bleibt das aktuelle (bzw. das aus der Sicherung) erhalten."
+        )
+        self.wallpaper_enabled_check.connect("toggled", self.on_wallpaper_enabled_toggled)
+        box.append(self.wallpaper_enabled_check)
+
+        self.wallpaper_revealer = Gtk.Revealer()
+        self.wallpaper_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        self.wallpaper_revealer.set_transition_duration(300)
+        self.wallpaper_revealer.set_reveal_child(False)
+
+        reveal_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        reveal_box.set_margin_top(8)
+
+        self.wallpaper_status_label = Gtk.Label()
+        self.wallpaper_status_label.set_halign(Gtk.Align.CENTER)
+        self.wallpaper_status_label.set_wrap(True)
+        self.wallpaper_status_label.set_margin_top(4)
+        self.wallpaper_status_label.set_visible(False)
+        reveal_box.append(self.wallpaper_status_label)
+
+        progress_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        progress_row.set_halign(Gtk.Align.CENTER)
+        progress_row.set_margin_top(4)
+        progress_row.set_margin_bottom(4)
+
+        self.wallpaper_spinner = Gtk.Spinner()
+        self.wallpaper_spinner.set_size_request(24, 24)
+        self.wallpaper_spinner.set_visible(False)
+        progress_row.append(self.wallpaper_spinner)
+
+        self.wallpaper_progress_label = Gtk.Label()
+        self.wallpaper_progress_label.set_markup(
+            "<span foreground='#3584e4' weight='bold'>Scanne …</span>"
+        )
+        self.wallpaper_progress_label.set_visible(False)
+        progress_row.append(self.wallpaper_progress_label)
+
+        reveal_box.append(progress_row)
+
+        self.wallpaper_info_label = Gtk.Label()
+        self.wallpaper_info_label.set_halign(Gtk.Align.CENTER)
+        self.wallpaper_info_label.set_wrap(True)
+        self.wallpaper_info_label.set_visible(False)
+        self._update_wallpaper_info(None)
+        reveal_box.append(self.wallpaper_info_label)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_vexpand(True)
+        scrolled.set_min_content_height(320)
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.add_css_class("wallpaper-scroll")
+
+        self.wallpaper_content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.wallpaper_content_box.set_margin_top(6)
+        self.wallpaper_content_box.set_margin_bottom(6)
+        self.wallpaper_content_box.set_margin_start(10)
+        self.wallpaper_content_box.set_margin_end(10)
+
+        scrolled.set_child(self.wallpaper_content_box)
+        reveal_box.append(scrolled)
+
+        self.wallpaper_revealer.set_child(reveal_box)
+        box.append(self.wallpaper_revealer)
+
+        nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        nav_box.set_halign(Gtk.Align.FILL)
+        nav_box.set_margin_top(20)
+
+        back_button = Gtk.Button(label="← Zurück")
+        back_button.connect("clicked", self.on_back_clicked)
+        nav_box.append(back_button)
+
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        nav_box.append(spacer)
+
+        next_button = Gtk.Button(label="Weiter →")
+        next_button.add_css_class("suggested-action")
+        next_button.connect("clicked", self.on_next_clicked)
+        nav_box.append(next_button)
+
+        self.skip_button_wallpaper = Gtk.Button(label="⏭️ Auswahl-Manager überspringen")
+        self.skip_button_wallpaper.set_sensitive(True)
+        self.skip_button_wallpaper.set_tooltip_text("Überspringt die Auswahl und verwendet die Standard-Einstellungen.")
+        self.skip_button_wallpaper.add_css_class("destructive-action")
+        self.skip_button_wallpaper.connect("clicked", self.on_skip_clicked)
+        nav_box.append(self.skip_button_wallpaper)
+
+        box.append(nav_box)
+        return box
+
+    def on_wallpaper_link_activated(self, label, uri):
+        try:
+            webbrowser.open(uri)
+        except Exception:
+            try:
+                subprocess.run(["xdg-open", uri], check=False)
+            except Exception as e:
+                print(f"Link konnte nicht geöffnet werden: {e}")
+        return True
+
+    def on_wallpaper_enabled_toggled(self, check):
+        enabled = check.get_active()
+
+        if not enabled:
+            self.wallpaper_revealer.set_reveal_child(False)
+            self.wallpaper_scan_running = False
+            self.wallpaper_spinner.stop()
+            self.wallpaper_spinner.set_visible(False)
+            self.wallpaper_progress_label.set_visible(False)
+            self.wallpaper_status_label.set_visible(False)
+            self.wallpaper_info_label.set_visible(False)
+            self.selected_wallpaper = None
+            self._clear_all_selections_visuals()
+            for fb in self.wallpaper_flowboxes:
+                try:
+                    fb.unselect_all()
+                except Exception:
+                    pass
+            self._update_wallpaper_info(None)
+            return
+
+        self.wallpaper_revealer.set_reveal_child(True)
+
+        if self.wallpaper_populated:
+            self.wallpaper_info_label.set_visible(True)
+            return
+
+        self.wallpaper_status_label.set_markup(
+            "<span foreground='#3584e4' weight='bold'>🔍 Ich scanne nach Hintergrundbildern …</span>"
+        )
+        self.wallpaper_status_label.set_visible(True)
+
+        self.wallpaper_spinner.set_visible(True)
+        self.wallpaper_spinner.start()
+
+        self.wallpaper_progress_label.set_visible(True)
+
+        self.wallpaper_info_label.set_visible(False)
+        self.wallpaper_scan_start_time = GLib.get_monotonic_time()
+
+        self.wallpaper_scan_running = True
+
+        threading.Thread(
+            target=self._scan_wallpapers_async,
+            daemon=True
+        ).start()
+
+    def _scan_dir(self, path, recursive=False, max_depth=2):
+        result = []
+        if not os.path.isdir(path):
+            return result
+
+        def _walk(current, depth):
+            try:
+                entries = sorted(os.listdir(current))
+            except Exception:
+                return
+            for name in entries:
+                full = os.path.join(current, name)
+                if os.path.isfile(full) and name.lower().endswith(IMAGE_EXTS):
+                    result.append(full)
+                elif recursive and os.path.isdir(full) and depth < max_depth:
+                    _walk(full, depth + 1)
+
+        _walk(path, 0)
+        return result
+
+    def _scan_wallpapers_async(self):
+        try:
+            log_lines = []
+            log_lines.append("=" * 60)
+            log_lines.append("Wallpaper-Scan:")
+            log_lines.append(f"Skript-Verzeichnis: {SCRIPT_DIR}")
+
+            extra_files = []
+            found_extra_dirs = []
+            checked_extra = []
+            seen_extra_realpaths = set()
+            for extra_dir in WALLPAPER_EXTRA_CANDIDATES:
+                real = os.path.realpath(extra_dir)
+                if real in seen_extra_realpaths:
+                    continue
+                seen_extra_realpaths.add(real)
+                exists = os.path.isdir(extra_dir)
+                checked_extra.append(f"[{'✓' if exists else '✗'}] {extra_dir}")
+                if exists:
+                    files_here = self._scan_dir(extra_dir)
+                    if files_here:
+                        found_extra_dirs.append(f"{extra_dir} ({len(files_here)} Dateien)")
+                        extra_files.extend(files_here)
+                        log_lines.append(f"  📁 Extra: {extra_dir} → {len(files_here)} Bilder")
+                    else:
+                        log_lines.append(f"  📁 Extra (leer): {extra_dir}")
+
+            if not found_extra_dirs:
+                log_lines.append("  📁 Extra: KEIN Extra-Wallpaper gefunden.")
+                log_lines.append("     Geprüfte Pfade:")
+                for line in checked_extra:
+                    log_lines.append(f"      {line}")
+
+            plus_files = []
+            plus_dir_found = ""
+            for d in WALLPAPER_PLUS_CANDIDATES:
+                if os.path.isdir(d):
+                    files_here = self._scan_dir(d)
+                    if files_here:
+                        plus_dir_found = d
+                        plus_files.extend(files_here)
+                        log_lines.append(f"  📁 PLUS: {d} → {len(files_here)} Bilder")
+                        break
+            if not plus_dir_found:
+                log_lines.append("  📁 PLUS: kein PLUS-Wallpaper-Ordner gefunden.")
+
+            ubuntu_files = []
+            ubuntu_dir_found = ""
+            for d in WALLPAPER_UBUNTU_CANDIDATES:
+                if os.path.isdir(d):
+                    files_here = self._scan_dir(d, recursive=True, max_depth=2)
+                    if files_here:
+                        ubuntu_dir_found = d
+                        ubuntu_files.extend(files_here)
+                        log_lines.append(f"  📁 Ubuntu: {d} → {len(files_here)} Bilder")
+                        break
+
+            user_files = self._scan_dir(WALLPAPER_USER_DIR)
+            log_lines.append(f"  📁 Eigenes ({WALLPAPER_USER_DIR}): {len(user_files)} Bilder (vor Dedup)")
+
+            seen = set()
+            def dedupe(paths):
+                result = []
+                for p in paths:
+                    name = os.path.basename(p)
+                    if name in seen:
+                        continue
+                    seen.add(name)
+                    result.append(p)
+                return result
+
+            extra_files  = dedupe(extra_files)
+            plus_files   = dedupe(plus_files)
+            ubuntu_files = dedupe(ubuntu_files)
+            user_files   = dedupe(user_files)
+
+            log_lines.append(
+                f"  Nach Dedup: Extra={len(extra_files)} · PLUS={len(plus_files)} · "
+                f"Ubuntu={len(ubuntu_files)} · Eigenes={len(user_files)}"
+            )
+            log_lines.append("=" * 60)
+
+            for line in log_lines:
+                print(line)
+
+            GLib.idle_add(
+                self._on_scan_complete,
+                user_files, extra_files, plus_files, ubuntu_files, log_lines
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            GLib.idle_add(self._on_scan_error, str(e))
+
+    def _on_scan_complete(self, user_files, extra_files, plus_files, ubuntu_files, log_lines):
+        self.wallpaper_scan_running = False
+
+        min_display_us = 1_500_000
+        if self.wallpaper_scan_start_time is not None:
+            elapsed = GLib.get_monotonic_time() - self.wallpaper_scan_start_time
+            delay_us = max(0, min_display_us - elapsed)
+            delay_ms = int(delay_us / 1000)
+        else:
+            delay_ms = 0
+
+        print(f"   → Scan dauerte, warte noch {delay_ms} ms für Mindestanzeige")
+
+        GLib.timeout_add(
+            delay_ms,
+            self._finalize_scan,
+            user_files, extra_files, plus_files, ubuntu_files
+        )
+        return False
+
+    def _finalize_scan(self, user_files, extra_files, plus_files, ubuntu_files):
+        while True:
+            child = self.wallpaper_content_box.get_first_child()
+            if child is None:
+                break
+            self.wallpaper_content_box.remove(child)
+
+        self.wallpaper_map.clear()
+        self.wallpaper_frames.clear()
+        self.wallpaper_check_labels.clear()
+        self.wallpaper_flowboxes.clear()
+
+        self._gallery_tasks = []
+        self._gallery_tasks.append(("🖼️ Eigenes Wallpaper", user_files, True))
+        if extra_files:
+            self._gallery_tasks.append(("🌟 Extra Wallpaper", extra_files, False))
+        if plus_files:
+            self._gallery_tasks.append(("🎨 Ubuntu-PLUS Wallpaper", plus_files, False))
+        if ubuntu_files:
+            self._gallery_tasks.append(("🐧 Ubuntu Standard Wallpaper", ubuntu_files, False))
+
+        self._gallery_task_idx = 0
+        self._gallery_path_idx = 0
+        self._gallery_current_flowbox = None
+
+        GLib.idle_add(self._build_gallery_chunk)
+        return False
+
+    def _build_gallery_chunk(self):
+        MAX_CHUNK_TIME = 0.03
+        start = time.time()
+
+        while self._gallery_task_idx < len(self._gallery_tasks):
+            if time.time() - start > MAX_CHUNK_TIME:
+                GLib.idle_add(self._build_gallery_chunk)
+                return False
+
+            title_text, paths, with_chooser = self._gallery_tasks[self._gallery_task_idx]
+
+            if self._gallery_path_idx == 0:
+                self._add_wallpaper_section_header(title_text, with_chooser)
+                self._gallery_current_flowbox = self._create_flowbox()
+                self.wallpaper_content_box.append(self._gallery_current_flowbox)
+                self.wallpaper_flowboxes.append(self._gallery_current_flowbox)
+
+            if self._gallery_path_idx < len(paths):
+                self._add_wallpaper_thumb(
+                    self._gallery_current_flowbox,
+                    paths[self._gallery_path_idx]
+                )
+                self._gallery_path_idx += 1
+            else:
+                self._gallery_task_idx += 1
+                self._gallery_path_idx = 0
+                self._gallery_current_flowbox = None
+
+        if not self.wallpaper_map:
+            empty = Gtk.Label()
+            empty.set_markup(
+                "<span foreground='#9a9996'><i>Keine Wallpaper gefunden.</i></span>"
+            )
+            empty.set_halign(Gtk.Align.CENTER)
+            empty.set_margin_top(40)
+            self.wallpaper_content_box.append(empty)
+
+        self.wallpaper_spinner.stop()
+        self.wallpaper_spinner.set_visible(False)
+        self.wallpaper_progress_label.set_visible(False)
+        self.wallpaper_status_label.set_visible(False)
+
+        self.wallpaper_populated = True
+        self.wallpaper_info_label.set_visible(True)
+        self.wallpaper_scan_start_time = None
+        return False
+
+    def _on_scan_error(self, msg):
+        self.wallpaper_scan_running = False
+        self.wallpaper_spinner.stop()
+        self.wallpaper_spinner.set_visible(False)
+        self.wallpaper_progress_label.set_visible(False)
+        self.wallpaper_status_label.set_markup(
+            f"<span foreground='#e01b24' weight='bold'>❌ Scan fehlgeschlagen: {msg}</span>"
+        )
+        self.wallpaper_status_label.set_visible(True)
+        return False
+
+    def _add_wallpaper_section_header(self, title_text, with_file_chooser=False):
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        header.set_halign(Gtk.Align.FILL)
+        header.set_margin_top(8)
+
+        title = Gtk.Label()
+        title.set_markup(f"<b>{title_text}</b>")
+        title.add_css_class("wallpaper-section-title")
+        title.set_halign(Gtk.Align.START)
+        title.set_hexpand(True)
+        header.append(title)
+
+        if with_file_chooser:
+            chooser_btn = Gtk.Button(label="📂 Eigene Datei wählen…")
+            chooser_btn.set_tooltip_text(
+                "Öffnet einen Datei-Browser, um ein eigenes Bild auszuwählen.\n"
+                "Standardmäßig startet er im Ordner ~/Bilder."
+            )
+            chooser_btn.connect("clicked", self._open_custom_file_chooser)
+            header.append(chooser_btn)
+
+        self.wallpaper_content_box.append(header)
+
+    def _create_flowbox(self):
+        flowbox = Gtk.FlowBox()
+        flowbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        flowbox.set_max_children_per_line(4)
+        flowbox.set_min_children_per_line(3)
+        flowbox.set_row_spacing(8)
+        flowbox.set_column_spacing(8)
+        flowbox.set_homogeneous(True)
+        flowbox.set_valign(Gtk.Align.START)
+        flowbox.set_activate_on_single_click(False)
+        flowbox.connect("child-activated", self._on_wallpaper_thumb_activated)
+        flowbox.connect(
+            "selected-children-changed",
+            lambda fb: self._on_wallpaper_thumb_selected(fb)
+        )
+        return flowbox
+
+    def _add_wallpaper_thumb(self, flowbox, path):
+        try:
+            picture = Gtk.Picture.new_for_filename(path)
+            if picture is None:
+                return
+            picture.set_content_fit(Gtk.ContentFit.COVER)
+            picture.set_size_request(150, 90)
+            picture.set_can_shrink(True)
+        except Exception as e:
+            print(f"Konnte Wallpaper nicht laden: {path} – {e}")
+            return
+
+        name = os.path.basename(path)
+        display_name = name if len(name) <= 24 else name[:21] + "…"
+
+        name_label = Gtk.Label(label=display_name)
+        name_label.set_ellipsize(3)
+        name_label.set_max_width_chars(20)
+        name_label.set_halign(Gtk.Align.CENTER)
+        name_label.set_margin_top(2)
+
+        check_label = Gtk.Label()
+        check_label.set_markup(
+            "<span foreground='white' weight='bold' size='x-large'>✓</span>"
+        )
+        check_label.set_halign(Gtk.Align.END)
+        check_label.set_valign(Gtk.Align.START)
+        check_label.set_margin_top(4)
+        check_label.set_margin_end(6)
+        check_label.set_visible(False)
+
+        overlay = Gtk.Overlay()
+        overlay.set_child(picture)
+        overlay.add_overlay(check_label)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        vbox.set_halign(Gtk.Align.CENTER)
+        vbox.set_margin_top(4)
+        vbox.set_margin_bottom(4)
+        vbox.set_margin_start(4)
+        vbox.set_margin_end(4)
+        vbox.append(overlay)
+        vbox.append(name_label)
+
+        frame = Gtk.Frame()
+        frame.set_child(vbox)
+        frame.add_css_class("wallpaper-thumb-frame")
+
+        child = Gtk.FlowBoxChild()
+        child.set_child(frame)
+        child.set_tooltip_text(f"{name}\n\nDoppelklick für große Vorschau")
+        flowbox.append(child)
+
+        self.wallpaper_map[child] = path
+        self.wallpaper_frames[child] = frame
+        self.wallpaper_check_labels[child] = check_label
+
+    def _clear_all_selections_visuals(self):
+        for frame in self.wallpaper_frames.values():
+            try:
+                frame.remove_css_class("wallpaper-thumb-frame-selected")
+            except Exception:
+                pass
+        for lbl in self.wallpaper_check_labels.values():
+            try:
+                lbl.set_visible(False)
+            except Exception:
+                pass
+
+    def _on_wallpaper_thumb_selected(self, flowbox):
+        self._clear_all_selections_visuals()
+
+        selected = flowbox.get_selected_children()
+        if not selected:
+            return
+
+        child = selected[0]
+        path = self.wallpaper_map.get(child)
+        if not path:
+            return
+
+        frame = self.wallpaper_frames.get(child)
+        if frame is not None:
+            try:
+                frame.add_css_class("wallpaper-thumb-frame-selected")
+            except Exception:
+                pass
+
+        check_lbl = self.wallpaper_check_labels.get(child)
+        if check_lbl is not None:
+            try:
+                check_lbl.set_visible(True)
+            except Exception:
+                pass
+
+        for fb in self.wallpaper_flowboxes:
+            if fb is not flowbox:
+                try:
+                    fb.unselect_all()
+                except Exception:
+                    pass
+
+        self.selected_wallpaper = path
+        self._update_wallpaper_info(path)
+
+    def _on_wallpaper_thumb_activated(self, flowbox, child):
+        path = self.wallpaper_map.get(child)
+        if not path:
+            return
+        self._open_wallpaper_preview(path)
+
+    def _open_wallpaper_preview(self, path):
+        try:
+            preview = Adw.Window()
+            preview.set_transient_for(self.window)
+            preview.set_modal(True)
+            preview.set_title(os.path.basename(path))
+            preview.set_default_size(950, 720)
+
+            toolbar_view = Adw.ToolbarView()
+            header = Adw.HeaderBar()
+            toolbar_view.add_top_bar(header)
+
+            scrolled = Gtk.ScrolledWindow()
+            scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+            scrolled.add_css_class("wallpaper-scroll")
+
+            picture = Gtk.Picture.new_for_filename(path)
+            picture.set_can_shrink(True)
+            picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+
+            scrolled.set_child(picture)
+            toolbar_view.set_content(scrolled)
+
+            preview.set_content(toolbar_view)
+            preview.present()
+        except Exception as e:
+            self.show_message_dialog(
+                "Vorschau fehlgeschlagen",
+                f"Das Bild konnte nicht angezeigt werden:\n\n{e}",
+                is_error=True
+            )
+
+    def _open_custom_file_chooser(self, button):
+        try:
+            dialog = Gtk.FileChooserNative.new(
+                "Eigenes Wallpaper auswählen",
+                self.window,
+                Gtk.FileChooserAction.OPEN,
+                "Auswählen",
+                "Abbrechen"
+            )
+
+            bilder_path = WALLPAPER_USER_DIR
+            if os.path.isdir(bilder_path):
+                try:
+                    dialog.set_current_folder(Gio.File.new_for_path(bilder_path))
+                except Exception:
+                    pass
+
+            img_filter = Gtk.FileFilter()
+            img_filter.set_name("Bilder")
+            for ext in ["*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp",
+                        "*.JPG", "*.JPEG", "*.PNG"]:
+                img_filter.add_pattern(ext)
+            dialog.add_filter(img_filter)
+
+            all_filter = Gtk.FileFilter()
+            all_filter.set_name("Alle Dateien")
+            all_filter.add_pattern("*")
+            dialog.add_filter(all_filter)
+
+            dialog.connect("response", self._on_custom_file_chosen)
+            dialog.show()
+        except Exception as e:
+            self.show_message_dialog(
+                "Datei-Browser fehlgeschlagen",
+                f"Der Datei-Browser konnte nicht geöffnet werden:\n\n{e}",
+                is_error=True
+            )
+
+    def _on_custom_file_chosen(self, dialog, response):
+        try:
+            if response == Gtk.ResponseType.ACCEPT:
+                gfile = dialog.get_file()
+                if gfile:
+                    path = gfile.get_path()
+                    if path and os.path.isfile(path):
+                        self.selected_wallpaper = path
+                        self._clear_all_selections_visuals()
+                        for fb in self.wallpaper_flowboxes:
+                            try:
+                                fb.unselect_all()
+                            except Exception:
+                                pass
+                        self._update_wallpaper_info(path)
+        except Exception as e:
+            print(f"Fehler bei der Dateiauswahl: {e}")
+        finally:
+            dialog.destroy()
+
+    def _update_wallpaper_info(self, path):
+        if path:
+            name = os.path.basename(path)
+            self.wallpaper_info_label.set_markup(
+                f"<span foreground='{COLOR_INSTALLED}' weight='bold'>✅ Ausgewählt:</span> "
+                f"<b>{name}</b>"
+            )
+        else:
+            self.wallpaper_info_label.set_markup(
+                f"<span foreground='{COLOR_NOT_INSTALLED}'>"
+                "Kein Wallpaper ausgewählt – das aktuelle Hintergrundbild bleibt erhalten."
+                "</span>"
+            )
+
+    # =========================================================
+    # 5. Firewall-Seite
+    # =========================================================
+    def create_firewall_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+        box.set_margin_top(40)
+        box.set_margin_bottom(40)
+        box.set_margin_start(40)
+        box.set_margin_end(40)
+        box.set_halign(Gtk.Align.CENTER)
+        box.set_valign(Gtk.Align.CENTER)
+
+        title = Gtk.Label()
+        title.set_markup("<span size='x-large' weight='bold'>🛡️ Firewall</span>")
+        title.set_halign(Gtk.Align.CENTER)
+        box.append(title)
+
+        desc = Gtk.Label()
+        desc.set_markup(
+            "Möchtest du die Firewall aktivieren?\n\n"
+            "• <b>UFW (Uncomplicated Firewall)</b> – Ist eine einfache Firewall für Linux\n"
+            "<span foreground='#159AFA'>💡 Tipp:</span> Eine Firewall ist unter Linux nicht zwingend nötig,\n"
+            "da auf einem normalen Desktop meist keine offenen Netzwerkdienste aktiv sind,\n"
+            "Sie kann aber zusätzlichen Schutz bieten, besonders wenn Dienste wie Samba oder SSH genutzt werden.\n\n"
+        )
+        desc.set_wrap(True)
+        desc.set_halign(Gtk.Align.CENTER)
+        desc.set_justify(Gtk.Justification.CENTER)
+        box.append(desc)
+
+        self.firewall_check = Gtk.CheckButton(label="✅ Firewall aktivieren (Standard: aktiviert)")
+        self.firewall_check.set_active(self.firewall_enabled)
+        self.firewall_check.set_halign(Gtk.Align.CENTER)
+        self.firewall_check.connect("toggled", self.on_firewall_toggled)
+        box.append(self.firewall_check)
+
+        nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        nav_box.set_halign(Gtk.Align.FILL)
+        nav_box.set_margin_top(30)
+
+        back_button = Gtk.Button(label="← Zurück")
+        back_button.connect("clicked", self.on_back_clicked)
+        nav_box.append(back_button)
+
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        nav_box.append(spacer)
+
+        next_button = Gtk.Button(label="Weiter →")
+        next_button.add_css_class("suggested-action")
+        next_button.connect("clicked", self.on_next_clicked)
+        nav_box.append(next_button)
+
+        self.skip_button_firewall = Gtk.Button(label="⏭️ Auswahl-Manager überspringen")
+        self.skip_button_firewall.set_sensitive(True)
+        self.skip_button_firewall.set_tooltip_text("Überspringt die Auswahl und verwendet die Standard-Einstellungen.")
+        self.skip_button_firewall.add_css_class("destructive-action")
+        self.skip_button_firewall.connect("clicked", self.on_skip_clicked)
+        nav_box.append(self.skip_button_firewall)
+
+        box.append(nav_box)
+        return box
+
+    def on_firewall_toggled(self, button):
+        self.firewall_enabled = button.get_active()
+
+    # =========================================================
+    # 6. Zusammenfassung
+    # =========================================================
+    def create_summary_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+        box.set_margin_top(40)
+        box.set_margin_bottom(40)
+        box.set_margin_start(40)
+        box.set_margin_end(40)
+        box.set_halign(Gtk.Align.CENTER)
+        box.set_valign(Gtk.Align.CENTER)
+
+        title = Gtk.Label()
+        title.set_markup("<span size='x-large' weight='bold'>✅ Bereit für die Installation</span>")
+        title.set_halign(Gtk.Align.CENTER)
+        box.append(title)
+
+        summary = Gtk.Label()
+
+        games_status = "✅ aktiviert" if self.games_check.get_active() else "❌ deaktiviert"
+        firewall_status = "✅ aktiviert" if self.firewall_check.get_active() else "❌ deaktiviert"
+
+        office_key = self.get_selected_office_suite()
+        office_names = {
+            "libreoffice": "LibreOffice",
+            "onlyoffice":  "ONLYOFFICE Desktop Editors",
+            "abiword":     "AbiWord + Gnumeric",
+            "none":        "❌ keine Büro-Software",
+        }
+        office_status = office_names.get(office_key, office_key)
+        if office_key != "none":
+            office_status = "✅ " + office_status
+
+        browser_actions = []
+        for name, chk, installed in [
+            ("Brave",         self.brave_check,   self.brave_installed),
+            ("Vivaldi",       self.vivaldi_check, self.vivaldi_installed),
+            ("Google Chrome", self.chrome_check,  self.chrome_installed),
+            ("Firefox",       self.firefox_check, self.firefox_installed),
+        ]:
+            if chk.get_active() and installed:
+                browser_actions.append(f"🗑️ {name} (entfernen)")
+            elif chk.get_active() and not installed:
+                browser_actions.append(f"⬇️ {name} (installieren)")
+            elif installed:
+                browser_actions.append(f"✅ {name} (behalten)")
+        browsers_str = ", ".join(browser_actions) if browser_actions else "keine Änderungen"
+
+        if self.wallpaper_enabled_check.get_active() and self.selected_wallpaper:
+            wallpaper_status = f"🖼️ {os.path.basename(self.selected_wallpaper)}"
+        else:
+            wallpaper_status = "aktuelles behalten"
+
+        icons_install = []
+        if self.icon_whitesur_chk.get_active(): icons_install.append("WhiteSur")
+        if self.icon_minty_chk.get_active():    icons_install.append("Mint‑Y")
+        if self.icon_we10x_chk.get_active():    icons_install.append("We10X")
+        if self.icon_breeze_chk.get_active():   icons_install.append("Breeze")
+        if self.icon_zorin_chk.get_active():    icons_install.append("ZorinOS")
+        if self.icon_moka_chk.get_active():     icons_install.append("Moka")
+        if self.icon_numix_chk.get_active():    icons_install.append("Numix")
+        if self.icon_pop_chk.get_active():      icons_install.append("Pop")
+        if self.icon_papirus_chk.get_active():  icons_install.append("Papirus")
+
+        icons_install_str = ", ".join(icons_install) if icons_install else "nur Yaru (Ubuntu‑Standard)"
+
+        if self.radio_whitesur.get_active():
+            default_key = "whitesur"
+        elif self.radio_minty.get_active():
+            default_key = "minty"
+        elif self.radio_we10x.get_active():
+            default_key = "we10x"
+        elif self.radio_breeze.get_active():
+            default_key = "breeze"
+        elif self.radio_zorin.get_active():
+            default_key = "zorin"
+        elif self.radio_moka.get_active():
+            default_key = "moka"
+        elif self.radio_numix.get_active():
+            default_key = "numix"
+        elif self.radio_pop.get_active():
+            default_key = "pop"
+        elif self.radio_papirus.get_active():
+            default_key = "papirus"
+        elif self.radio_yaru.get_active():
+            default_key = "yaru"
+        else:
+            default_key = "whitesur"
+
+        icon_names = {
+            "whitesur": "WhiteSur", "minty": "Mint‑Y", "we10x": "We10X",
+            "breeze": "Breeze", "zorin": "ZorinOS", "moka": "Moka",
+            "numix": "Numix", "pop": "Pop", "papirus": "Papirus",
+            "yaru": "Yaru (Ubuntu‑Standard)"
+        }
+        default_icon_name = icon_names.get(default_key, default_key)
+
+        summary.set_markup(
+            "Du hast folgende Auswahl getroffen:\n\n"
+            f"🎮 <b>Spiele-Unterstützung:</b> {games_status}\n"
+            f"📄 <b>Büro-Software:</b> {office_status}\n"
+            f"🌐 <b>Browser-Aktionen:</b> {browsers_str}\n"
+            f"🎨 <b>Installierte Icon‑Sets:</b> {icons_install_str}\n"
+            f"🎨 <b>Standard‑Icon‑Set:</b> {default_icon_name}\n"
+            f"🖼️ <b>Hintergrundbild:</b> {wallpaper_status}\n"
+            f"🛡️ <b>Firewall:</b> {firewall_status}\n\n"
+            "Klicke auf <b>„Jetzt anwenden“</b>, um aus deinem normalen Ubuntu\n"
+            "ein <b>Ubuntu-PLUS</b> zu machen."
+        )
+        summary.set_wrap(True)
+        summary.set_halign(Gtk.Align.CENTER)
+        summary.set_justify(Gtk.Justification.CENTER)
+        box.append(summary)
+
+        nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        nav_box.set_halign(Gtk.Align.FILL)
+        nav_box.set_margin_top(30)
+
+        back_button = Gtk.Button(label="← Zurück")
+        back_button.connect("clicked", self.on_back_clicked)
+        nav_box.append(back_button)
+
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        nav_box.append(spacer)
+
+        apply_button = Gtk.Button(label="⚡ Jetzt anwenden")
+        apply_button.add_css_class("suggested-action")
+        apply_button.connect("clicked", self.on_apply_clicked)
+        nav_box.append(apply_button)
+
+        cancel_button = Gtk.Button(label="❌ Beenden/Abbrechen")
+        cancel_button.add_css_class("destructive-action")
+        cancel_button.connect("clicked", self.on_cancel_clicked)
+        nav_box.append(cancel_button)
+
+        box.append(nav_box)
+        return box
+
+    # =========================================================
+    # 7. Installations-Seite
+    # =========================================================
+    def create_install_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_margin_top(20)
+        box.set_margin_bottom(20)
+        box.set_margin_start(20)
+        box.set_margin_end(20)
+
+        title = Gtk.Label()
+        title.set_markup("<span size='x-large' weight='bold'>🔄 Installation läuft ...</span>")
+        title.set_halign(Gtk.Align.CENTER)
+        box.append(title)
+
+        status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        status_box.set_halign(Gtk.Align.CENTER)
+        status_box.set_margin_bottom(10)
+
+        self.install_status = Gtk.Label(label="...dies kann einige Minuten dauern ...")
+        self.install_status.set_halign(Gtk.Align.CENTER)
+        status_box.append(self.install_status)
+
+        box.append(status_box)
+
+        self.progress_bar = Gtk.ProgressBar()
+        self.progress_bar.set_show_text(True)
+        self.progress_bar.set_text("Installation läuft ...")
+        self.progress_bar.set_halign(Gtk.Align.FILL)
+        self.progress_bar.set_margin_bottom(10)
+        self.progress_bar.set_pulse_step(0.1)
+        box.append(self.progress_bar)
+
+        self.log_toggle_button = Gtk.ToggleButton(label="📄 Log-Fenster anzeigen")
+        self.log_toggle_button.set_halign(Gtk.Align.CENTER)
+        self.log_toggle_button.set_margin_bottom(5)
+        self.log_toggle_button.connect("toggled", self.on_log_toggle)
+        box.append(self.log_toggle_button)
+
+        self.log_revealer = Gtk.Revealer()
+        self.log_revealer.set_reveal_child(False)
+        self.log_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        self.log_revealer.set_transition_duration(300)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_vexpand(True)
+        scrolled.set_min_content_height(200)
+
+        self.output_buffer = Gtk.TextBuffer()
+        self.output_view = Gtk.TextView.new_with_buffer(self.output_buffer)
+        self.output_view.set_editable(False)
+        self.output_view.set_cursor_visible(False)
+        self.output_view.set_monospace(True)
+        self.output_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+
+        scrolled.set_child(self.output_view)
+        self.log_revealer.set_child(scrolled)
+        box.append(self.log_revealer)
+
+        self.cancel_install_button = Gtk.Button(label="❌ Abbrechen")
+        self.cancel_install_button.add_css_class("destructive-action")
+        self.cancel_install_button.set_halign(Gtk.Align.CENTER)
+        self.cancel_install_button.set_sensitive(False)
+        self.cancel_install_button.connect("clicked", self.on_cancel_clicked)
+        box.append(self.cancel_install_button)
+
+        return box
+
+    def on_log_toggle(self, button):
+        active = button.get_active()
+        self.log_revealer.set_reveal_child(active)
+        if active:
+            button.set_label("📄 Log-Fenster ausblenden")
+        else:
+            button.set_label("📄 Log-Fenster anzeigen")
+
+    def start_pulse(self):
+        self.progress_bar.set_text("Installation läuft ...")
+        self.progress_bar.set_fraction(0.0)
+        self.pulse_timer = GLib.timeout_add(100, self._pulse_callback)
+
+    def _pulse_callback(self):
+        self.progress_bar.pulse()
+        return True
+
+    def stop_pulse(self, success=True):
+        if self.pulse_timer is not None:
+            GLib.source_remove(self.pulse_timer)
+            self.pulse_timer = None
+        if success:
+            self.progress_bar.set_fraction(1.0)
+            self.progress_bar.set_text("✅ Installation abgeschlossen!")
+        else:
+            self.progress_bar.set_text("❌ Installation fehlgeschlagen")
+
+    def on_next_clicked(self, button):
+        if self.current_page == 0:
+            self.current_page = 1
+            self.page_stack.set_visible_child_name("games")
+        elif self.current_page == 1:
+            self.current_page = 2
+            self.page_stack.set_visible_child_name("office")
+        elif self.current_page == 2:
+            self.current_page = 3
+            self.page_stack.set_visible_child_name("browser")
+        elif self.current_page == 3:
+            self.current_page = 4
+            self.page_stack.set_visible_child_name("icons")
+        elif self.current_page == 4:
+            mapping = {
+                "whitesur": (self.radio_whitesur, self.icon_whitesur_chk),
+                "minty":    (self.radio_minty,    self.icon_minty_chk),
+                "we10x":    (self.radio_we10x,    self.icon_we10x_chk),
+                "breeze":   (self.radio_breeze,   self.icon_breeze_chk),
+                "zorin":    (self.radio_zorin,    self.icon_zorin_chk),
+                "moka":     (self.radio_moka,     self.icon_moka_chk),
+                "numix":    (self.radio_numix,    self.icon_numix_chk),
+                "pop":      (self.radio_pop,      self.icon_pop_chk),
+                "papirus":  (self.radio_papirus,  self.icon_papirus_chk),
+                "yaru":     (self.radio_yaru,     None),
+            }
+
+            for icon_key, (radio, chk) in mapping.items():
+                if radio.get_active() and chk is not None and not chk.get_active():
+                    dialog = Gtk.MessageDialog(
+                        transient_for=self.window,
+                        modal=True,
+                        text="⚠️ Standard-Icon nicht zur Installation ausgewählt!",
+                        secondary_text=(
+                            f"Du hast „{radio.get_label()}“ als Standard-Icon-Set gewählt,\n"
+                            f"aber „{chk.get_label()}“ ist nicht zur Installation ausgewählt.\n\n"
+                            "Bitte wähle das Icon-Set zur Installation aus, oder ändere\n"
+                            "dein Standard-Icon auf ein bereits installiertes Set."
+                        )
+                    )
+                    dialog.add_button("OK", Gtk.ResponseType.OK)
+                    dialog.connect("response", lambda d, r: d.destroy())
+                    dialog.present()
+                    return
+
+            self.current_page = 5
+            self.page_stack.set_visible_child_name("wallpaper")
+        elif self.current_page == 5:
+            self.current_page = 6
+            self.page_stack.set_visible_child_name("firewall")
+        elif self.current_page == 6:
+            self.current_page = 7
+            if self.page_stack.get_child_by_name("summary") is None:
+                self.page_summary = self.create_summary_page()
+                self.page_stack.add_named(self.page_summary, "summary")
+            else:
+                old = self.page_stack.get_child_by_name("summary")
+                if old is not None:
+                    self.page_stack.remove(old)
+                self.page_summary = self.create_summary_page()
+                self.page_stack.add_named(self.page_summary, "summary")
+            self.page_stack.set_visible_child_name("summary")
+
+    def on_back_clicked(self, button):
+        if self.current_page == 1:
+            self.current_page = 0
+            self.page_stack.set_visible_child_name("welcome")
+        elif self.current_page == 2:
+            self.current_page = 1
+            self.page_stack.set_visible_child_name("games")
+        elif self.current_page == 3:
+            self.current_page = 2
+            self.page_stack.set_visible_child_name("office")
+        elif self.current_page == 4:
+            self.current_page = 3
+            self.page_stack.set_visible_child_name("browser")
+        elif self.current_page == 5:
+            self.current_page = 4
+            self.page_stack.set_visible_child_name("icons")
+        elif self.current_page == 6:
+            self.current_page = 5
+            self.page_stack.set_visible_child_name("wallpaper")
+        elif self.current_page == 7:
+            self.current_page = 6
+            self.page_stack.set_visible_child_name("firewall")
+
+    def on_skip_clicked(self, button):
+        self.current_page = 7
+        if self.page_stack.get_child_by_name("summary") is None:
+            self.page_summary = self.create_summary_page()
+            self.page_stack.add_named(self.page_summary, "summary")
+        else:
+            old = self.page_stack.get_child_by_name("summary")
+            if old is not None:
+                self.page_stack.remove(old)
+            self.page_summary = self.create_summary_page()
+            self.page_stack.add_named(self.page_summary, "summary")
+        self.page_stack.set_visible_child_name("summary")
+
+    def on_cancel_clicked(self, button):
+        if not self.installation_done:
+            self.window.destroy()
+        else:
+            self.show_success_dialog()
+
+    def show_success_dialog(self):
+        dialog = Gtk.MessageDialog(
+            transient_for=self.window,
+            modal=True,
+            text="✅ Ubuntu-PLUS wurde erfolgreich installiert!",
+            secondary_text=(
+                "ℹ️  Der Ubuntu-PLUS Transformer entfernt sich jetzt automatisch.\n"
+                "    Deine Wallpaper, Icons und Einstellungen bleiben erhalten.\n\n"
+                "⚠️  Starte den Rechner neu, um alle Änderungen wirksam zu machen.\n\n"
+                " Falls du WhiteSur nicht als Standard-Icon-Theme gelassen hast,\n"
+                "    kann es beim ersten Start vom Ubuntu-PLUS App-Store einen Moment dauern,\n"
+                "    bis alle Icons heruntergeladen und korrekt angezeigt werden.\n\n"
+                "ℹ️  Falls du den Transformer manuell entfernen willst:\n"
+                "    sudo apt remove --purge ubuntu-plus-transformer"
+            )
+        )
+        reboot_btn = dialog.add_button("🔄 Jetzt neu starten", 1)
+        exit_btn = dialog.add_button("❌ Beenden", 2)
+        reboot_btn.add_css_class("suggested-action")
+        exit_btn.add_css_class("destructive-action")
+        dialog.connect("response", self._on_success_dialog_response)
+        dialog.present()
+
+    def _on_success_dialog_response(self, dialog, response):
+        dialog.destroy()
+        if response == 1:
+            # Reboot: Erst Info-Dialog, dann direkt pkexec reboot.
+            # Keine 20-Sekunden-Wartezeit – der Boot-Time-Service
+            # entfernt den Transformer ohnehin nach dem Reboot.
+            self._show_reboot_info_dialog()
+        elif response == 2:
+            # Beenden: systemd-run-Timer (20s) läuft im CLI im
+            # Hintergrund und entfernt den Transformer noch in dieser
+            # Sitzung. Der User kann den PC normal weiterbenutzen.
+            self.quit()
+
+    def _show_reboot_info_dialog(self):
+        dialog = Gtk.MessageDialog(
+            transient_for=self.window,
+            modal=True,
+            text="🔄 Neustart wird vorbereitet",
+            secondary_text=(
+                "Der Ubuntu-PLUS Transformer wird sich automatisch "
+                "entfernen – entweder noch vor dem Neustart oder direkt "
+                "nach dem nächsten Boot.\n\n"
+                "Deine Wallpaper, Icons und Einstellungen bleiben erhalten.\n\n"
+                "⚠️  Für den Neustart wird gleich dein Administrator-Passwort "
+                "abgefragt. Das ist bei einem Systemneustart normal – bitte "
+                "gib es ein, damit der Rechner neu starten kann."
+            )
+        )
+        dialog.add_button("❌ Abbrechen", Gtk.ResponseType.CANCEL)
+        ok_btn = dialog.add_button("🔄 Jetzt neu starten", Gtk.ResponseType.OK)
+        ok_btn.add_css_class("suggested-action")
+        dialog.connect("response", self._on_reboot_confirmed)
+        dialog.present()
+
+    def _on_reboot_confirmed(self, dialog, response):
+        dialog.destroy()
+        if response == Gtk.ResponseType.OK:
+            # pkexec-Aufruf direkt – Passwort-Dialog kommt sofort
+            try:
+                subprocess.run(["pkexec", "reboot"], check=False)
+            except Exception as e:
+                self.show_message_dialog("Fehler beim Neustart", str(e), is_error=True)
+            self.quit()
+
+    def on_apply_clicked(self, button):
+        dialog = Gtk.MessageDialog(
+            transient_for=self.window,
+            modal=True,
+            text="⚠️ WIRKLICH ALLE ÄNDERUNGEN ANWENDEN?",
+            secondary_text=(
+                "Diese Aktion wird TIEFGREIFENDE Veränderungen an deinem System vornehmen!\n\n"
+                "• Es werden Programme installiert und deinstalliert\n"
+                "• Systemeinstellungen werden dauerhaft geändert\n"
+                "• Deine persönlichen Dateien (Bilder, Musik, etc.) bleiben erhalten\n\n"
+                "Diese Änderungen KÖNNEN NICHT RÜCKGÄNGIG GEMACHT werden.\n\n"
+                "Bist du dir ABSOLUT SICHER, dass du fortfahren möchtest?"
+            )
+        )
+        dialog.add_button("❌ Abbrechen", Gtk.ResponseType.CANCEL)
+        apply_btn = dialog.add_button("✅ Ja, ich bin mir sicher – jetzt anwenden!", Gtk.ResponseType.OK)
+        apply_btn.add_css_class("destructive-action")
+
+        dialog.connect("response", self.on_apply_confirmed)
+        dialog.present()
+
+    def on_apply_confirmed(self, dialog, response):
+        dialog.destroy()
+        if response == Gtk.ResponseType.OK:
+            self.icon_whitesur = self.icon_whitesur_chk.get_active()
+            self.icon_minty = self.icon_minty_chk.get_active()
+            self.icon_we10x = self.icon_we10x_chk.get_active()
+            self.icon_breeze = self.icon_breeze_chk.get_active()
+            self.icon_zorin = self.icon_zorin_chk.get_active()
+            self.icon_moka = self.icon_moka_chk.get_active()
+            self.icon_numix = self.icon_numix_chk.get_active()
+            self.icon_pop = self.icon_pop_chk.get_active()
+            self.icon_papirus = self.icon_papirus_chk.get_active()
+
+            self.office_suite = self.get_selected_office_suite()
+
+            self.install_brave   = self.brave_check.get_active()   and not self.brave_installed
+            self.remove_brave    = self.brave_check.get_active()   and self.brave_installed
+            self.install_vivaldi = self.vivaldi_check.get_active() and not self.vivaldi_installed
+            self.remove_vivaldi  = self.vivaldi_check.get_active() and self.vivaldi_installed
+            self.install_chrome  = self.chrome_check.get_active()  and not self.chrome_installed
+            self.remove_chrome   = self.chrome_check.get_active()  and self.chrome_installed
+            self.install_firefox = self.firefox_check.get_active() and not self.firefox_installed
+            self.remove_firefox  = self.firefox_check.get_active() and self.firefox_installed
+
+            self.wallpaper_enabled = self.wallpaper_enabled_check.get_active()
+
+            if self.radio_whitesur.get_active():
+                self.default_icon = "whitesur"
+            elif self.radio_minty.get_active():
+                self.default_icon = "minty"
+            elif self.radio_we10x.get_active():
+                self.default_icon = "we10x"
+            elif self.radio_breeze.get_active():
+                self.default_icon = "breeze"
+            elif self.radio_zorin.get_active():
+                self.default_icon = "zorin"
+            elif self.radio_moka.get_active():
+                self.default_icon = "moka"
+            elif self.radio_numix.get_active():
+                self.default_icon = "numix"
+            elif self.radio_pop.get_active():
+                self.default_icon = "pop"
+            elif self.radio_papirus.get_active():
+                self.default_icon = "papirus"
+            elif self.radio_yaru.get_active():
+                self.default_icon = "yaru"
+
+            self.current_page = 8
+            self.page_stack.set_visible_child_name("install")
+
+            GLib.idle_add(self.start_pulse)
+
+            self.log_toggle_button.set_active(False)
+            self.log_revealer.set_reveal_child(False)
+            self.log_toggle_button.set_label("📄 Log-Fenster anzeigen")
+
+            threading.Thread(target=self.run_transformer, daemon=True).start()
+
+    # ─────────────────────────────────────────────────────────
+    # Backend-Aufruf
+    # ─────────────────────────────────────────────────────────
+    def _build_backend_args(self):
+        args = []
+
+        # ── Gaming ──
+        if self.games_enabled:
+            args += [
+                "--install-steam",
+                "--install-lutris",
+                "--install-heroic",
+                "--install-protonup",
+                "--install-protontricks",
+                "--install-faugus",
+                "--install-mangohud",
+                "--install-goverlay",
+                "--install-gamemode",
+            ]
+        else:
+            args.append("--no-games")
+
+        # ── Office ──
+        if self.office_suite == "none":
+            args.append("--no-office")
+        else:
+            args.append(f"--office={self.office_suite}")
+
+        # ── Browser installieren ──
+        if self.install_brave:
+            args.append("--install-brave")
+        if self.install_vivaldi:
+            args.append("--install-vivaldi")
+        if self.install_chrome:
+            args.append("--install-chrome")
+        if self.install_firefox:
+            args.append("--install-firefox")
+
+        # ── Browser entfernen ──
+        if self.remove_brave:
+            args.append("--remove-brave")
+        if self.remove_vivaldi:
+            args.append("--remove-vivaldi")
+        if self.remove_chrome:
+            args.append("--remove-chrome")
+        if self.remove_firefox:
+            args.append("--remove-firefox")
+
+        # ── Wallpaper ──
+        if self.wallpaper_enabled and self.selected_wallpaper:
+            wp_abs = os.path.abspath(os.path.expanduser(self.selected_wallpaper))
+            args.append(f"--wallpaper={wp_abs}")
+
+        # ── Firewall ──
+        if not self.firewall_enabled:
+            args.append("--no-firewall")
+
+        # ── Icon-Themes installieren ──
+        if self.icon_whitesur:
+            args.append("--install-whitesur")
+        if self.icon_minty:
+            args.append("--install-minty")
+        if self.icon_we10x:
+            args.append("--install-we10x")
+        if self.icon_breeze:
+            args.append("--install-breeze")
+        if self.icon_zorin:
+            args.append("--install-zorin")
+        if self.icon_moka:
+            args.append("--install-moka")
+        if self.icon_numix:
+            args.append("--install-numix")
+        if self.icon_pop:
+            args.append("--install-pop")
+        if self.icon_papirus:
+            args.append("--install-papirus")
+
+        args.append(f"--default-icon={self.default_icon}")
+
+        return args
+
+    def run_transformer(self):
+        args = self._build_backend_args()
+
+        script_path = None
+        possible_paths = [
+            "/usr/bin/ubuntu-plus-transformer",
+            "/usr/bin/ubuntu-transformer",
+            "/usr/local/bin/ubuntu-plus-transformer",
+            "/usr/local/bin/ubuntu-transformer",
+            os.path.join(SCRIPT_DIR, "ubuntu-plus-transformer"),
+            os.path.join(SCRIPT_DIR, "ubuntu-plus-transformer.sh"),
+            os.path.join(SCRIPT_DIR, "..", "bin", "ubuntu-plus-transformer"),
+        ]
+        for path in possible_paths:
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                script_path = path
+                break
+
+        if script_path is None:
+            GLib.idle_add(self.set_install_status, "❌ Transformer-Skript nicht gefunden.")
+            GLib.idle_add(self.append_output,
+                          "❌ Backend-Skript nicht gefunden. Bitte eines der\n"
+                          "   folgenden Pfade prüfen oder das Paket neu installieren:\n"
+                          + "\n".join(f"   • {p}" for p in possible_paths) + "\n")
+            GLib.idle_add(self.stop_pulse, False)
+            return
+
+        GLib.idle_add(self.append_output, f"ℹ️  Verwende Skript: {script_path}\n")
+        GLib.idle_add(self.append_output, f"ℹ️  Argumente: {' '.join(args)}\n")
+
+        pkexec_path = self.find_pkexec()
+        if not pkexec_path:
+            GLib.idle_add(self.set_install_status, "❌ pkexec nicht gefunden – bitte manuell ausführen.")
+            GLib.idle_add(self.stop_pulse, False)
+            return
+
+        # ─────────────────────────────────────────────────────
+        # EINFACHER pkexec-Aufruf (kein env-Wrapper).
+        # pkexec setzt automatisch PKEXEC_UID – das CLI-Skript
+        # erkennt den echten Benutzer dadurch zuverlässig.
+        # ─────────────────────────────────────────────────────
+        cmd = [pkexec_path, script_path] + args
+
+        # Info-Ausgabe (nur Log)
+        real_user = get_real_username()
+        GLib.idle_add(self.append_output,
+                      f"ℹ️  Aufrufender Benutzer (Info): {real_user or 'unbekannt'}\n")
+
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+            for line in iter(process.stdout.readline, ''):
+                GLib.idle_add(self.append_output, line)
+            process.wait()
+            if process.returncode == 0:
+                GLib.idle_add(self.set_install_status, "✅ Installation erfolgreich! Neustart empfohlen.")
+                GLib.idle_add(self.stop_pulse, True)
+                self.installation_done = True
+                GLib.idle_add(self.show_success_dialog)
+            else:
+                GLib.idle_add(self.set_install_status, f"❌ Fehler (Code {process.returncode})")
+                GLib.idle_add(self.stop_pulse, False)
+        except Exception as e:
+            GLib.idle_add(self.set_install_status, f"❌ Fehler: {str(e)}")
+            GLib.idle_add(self.stop_pulse, False)
+
+    def find_pkexec(self):
+        for path in os.environ.get("PATH", "").split(":"):
+            candidate = os.path.join(path, "pkexec")
+            if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        return None
+
+    def append_output(self, text):
+        end_iter = self.output_buffer.get_end_iter()
+        self.output_buffer.insert(end_iter, text)
+        self.output_view.scroll_to_iter(self.output_buffer.get_end_iter(), 0.0, True, 0.0, 0.0)
+
+    def set_install_status(self, message):
+        self.install_status.set_text(message)
+
+    def show_message_dialog(self, title, text, is_error=False):
+        dialog = Gtk.MessageDialog(
+            transient_for=self.window,
+            modal=True,
+            text=title,
+            secondary_text=text
+        )
+        btn = dialog.add_button("OK", Gtk.ResponseType.OK)
+        if is_error:
+            btn.add_css_class("destructive-action")
+        else:
+            btn.add_css_class("suggested-action")
+        dialog.connect("response", lambda d, r: d.destroy())
+        dialog.present()
+
+
+def main():
+    app = UbuntuTransformerWizard()
+    app.run(sys.argv)
+
+if __name__ == "__main__":
+    main()

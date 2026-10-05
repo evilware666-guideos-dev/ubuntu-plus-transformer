@@ -1,0 +1,2515 @@
+#!/bin/bash
+# Ubuntu-PLUS Transformer - Ubuntu in Ubuntu-PLUS transformieren.
+# (c) 2026 – Freigegeben unter GPL v3
+#
+# Fixes in dieser Version:
+#   • App-Grid: Kategorien alphabetisch (Virtualisierung vor Zubehör)
+#   • app-picker-layout: Positionen 12/13 korrekt zugewiesen
+#   • Utilities-Kategorie korrekt unter folders/Utilities (Slash statt Doppelpunkt)
+#   • Live-System-Erkennung
+#   • Wallpaper-Persistenz-Suche
+#   • Live-Reload der GNOME-Sitzung (kein Logout nötig)
+#   • Selbst-Deinstallation: systemd-run (sofort) + Boot-Time-Service (Sicherheitsnetz)
+#   • Cleanup-Trap: unattended-upgrades wird bei Abbruch reaktiviert
+#   • TIMER-BUG-FIX: UNATTENDED_STOPPED wird jetzt in beiden Schleifen gesetzt
+#   • ENDGÜLTIGER UNMASK: am Ende wird immer unmaskt, unabhängig vom Status
+#   • Firefox-Policies zusätzlich für Snap-Version hinterlegt
+#   • Flatpak-Theme-Overrides für echten Benutzer (nicht root)
+#   • needrestart wird auf "auto" gestellt (kein hängender Prompt)
+#   • Logfile unter /var/log/ubuntu-plus-transformer.log
+#   • Übergangs-Avatar (ubuntu-plus-transformer.png) bis Ubuntu den GNOME-46-Bug fixt
+#   • Zorin-Icon-Name korrigiert: ZorinBlue-Dark (statt ZorinOS-dark)
+#   • Yaru-Icon-Name korrigiert: Yaru-blue-dark (statt Yaru)
+#   • Icon-Cache wird nach jedem Theme-Install aktualisiert
+#   • Nautilus wird neu geladen, damit neue Icons sofort sichtbar sind
+#   • State-File: erledigte Schritte und Nutzerauswahl werden in
+#     /var/lib/ubuntu-plus-transformer/state.conf gespeichert. Beim zweiten
+#     Lauf werden diese Schritte übersprungen. Über --force lässt sich ein
+#     Neulauf erzwingen, über --reset wird der State gelöscht.
+
+# ────────────── HANG-FIX ──────────────
+export DEBIAN_FRONTEND=noninteractive
+
+export NEEDRESTART_MODE=a
+export NEEDRESTART_SUSPEND=1
+
+echo "ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true" | debconf-set-selections
+echo "ttf-mscorefonts-installer msttcorefonts/present-mscorefonts-eula note" | debconf-set-selections
+echo '* libraries/restart-without-asking boolean true' | debconf-set-selections
+# ──────────────────────────────────────
+
+set -e
+set -o pipefail
+
+# ────────────── LOGFILE ──────────────
+LOG_FILE="/var/log/ubuntu-plus-transformer.log"
+mkdir -p "$(dirname "$LOG_FILE")"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo ""
+echo "════════════════════════════════════════════════════════════"
+echo "=== Start: $(date) ==="
+echo "════════════════════════════════════════════════════════════"
+# ─────────────────────────────────────
+
+# ────────────── EARLY CLEANUP-TRAP ──────────────
+_UNATTENDED_BLOCKED=false
+cleanup_early() {
+    if [[ "$_UNATTENDED_BLOCKED" == "true" ]]; then
+        echo ">>> [Cleanup] Reaktiviere automatische Updates ..."
+        for service in unattended-upgrades apt-daily apt-daily-upgrade; do
+            systemctl unmask "$service" 2>/dev/null || true
+        done
+        for timer in apt-daily.timer apt-daily-upgrade.timer; do
+            systemctl unmask "$timer" 2>/dev/null || true
+        done
+        systemctl start apt-daily.timer 2>/dev/null || true
+        systemctl start apt-daily-upgrade.timer 2>/dev/null || true
+    fi
+}
+trap cleanup_early EXIT
+# ───────────────────────────────────────────────
+
+# ────────────── UNATTENDED-UPDATES KOMPLETT BLOCKIEREN ──────────────
+echo ">>> Blockiere automatische Updates während der Installation ..."
+
+UNATTENDED_STOPPED=false
+
+for timer in apt-daily.timer apt-daily-upgrade.timer; do
+    if systemctl is-active --quiet "$timer" 2>/dev/null; then
+        echo "   ⏸️  Stoppe Timer: $timer"
+        systemctl stop "$timer" 2>/dev/null || true
+        systemctl mask "$timer" 2>/dev/null || true
+        UNATTENDED_STOPPED=true
+    fi
+done
+
+for service in unattended-upgrades apt-daily apt-daily-upgrade; do
+    if systemctl is-active --quiet "$service" 2>/dev/null; then
+        echo "   ⏸️  Stoppe Dienst: $service"
+        systemctl stop "$service" 2>/dev/null || true
+        systemctl mask "$service" 2>/dev/null || true
+        UNATTENDED_STOPPED=true
+    fi
+done
+
+_UNATTENDED_BLOCKED=true
+
+echo "   ⏳ Warte, bis unattended-upgrades beendet ist ..."
+for i in {1..10}; do
+    if ! pgrep -x "unattended-upgr" >/dev/null 2>&1; then
+        echo "   ✅ unattended-upgrades ist beendet."
+        break
+    fi
+    sleep 1
+done
+
+if pgrep -x "unattended-upgr" >/dev/null 2>&1; then
+    echo "   ⚠️  unattended-upgrades läuft noch – beende hart ..."
+    pkill -f "unattended-upgr" 2>/dev/null || true
+    sleep 2
+fi
+
+for lock in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock; do
+    if [[ -f "$lock" ]]; then
+        echo "   🗑️  Entferne Sperre: $lock"
+        rm -f "$lock" 2>/dev/null || true
+    fi
+done
+
+export DEBIAN_FRONTEND=noninteractive
+export APT_OPTIONS="-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
+
+echo "   ✅ Automatische Updates blockiert."
+# ──────────────────────────────────────────────────────────────────────
+
+# ---------- Konfiguration ----------
+REBOOT=false
+# -----------------------------------
+
+# ---------- Parameter auswerten ----------
+NO_GAMES=false
+OFFICE_SUITE="libreoffice"
+NO_FIREWALL=false
+INSTALL_WHITESUR=false
+INSTALL_MINTY=false
+INSTALL_WE10X=false
+INSTALL_BREEZE=false
+INSTALL_ZORIN=false
+INSTALL_MOKA=false
+INSTALL_NUMIX=false
+INSTALL_POP=false
+INSTALL_PAPIRUS=false
+
+INSTALL_BRAVE=false
+INSTALL_VIVALDI=false
+INSTALL_CHROME=false
+
+REMOVE_BRAVE=false
+REMOVE_VIVALDI=false
+REMOVE_CHROME=false
+
+INSTALL_FIREFOX=false
+REMOVE_FIREFOX=false
+
+WALLPAPER=""
+
+INSTALL_STEAM=false
+INSTALL_LUTRIS=false
+INSTALL_HEROIC=false
+INSTALL_PROTONUP=false
+INSTALL_PROTONTRICKS=false
+INSTALL_FAUGUS=false
+INSTALL_MANGOHUD=false
+INSTALL_GOVERLAY=false
+INSTALL_GAMEMODE=false
+
+DEFAULT_ICON="whitesur"
+
+# ────────── State-Handling-Flags ──────────
+FORCE_RERUN=false
+RESET_STATE=false
+
+# ────────── Tracking der explizit übergebenen Argumente ──────────
+_ARG_SET_OFFICE=""
+_ARG_SET_DEFAULT_ICON=""
+_ARG_SET_WALLPAPER=""
+_ARG_SET_NO_GAMES=""
+_ARG_SET_NO_FIREWALL=""
+_BROWSER_ARG_SET=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --no-games) NO_GAMES=true; _ARG_SET_NO_GAMES="1" ;;
+        --no-office) OFFICE_SUITE="none"; _ARG_SET_OFFICE="1" ;;
+        --office=*) OFFICE_SUITE="${1#*=}"; _ARG_SET_OFFICE="1" ;;
+        --no-firewall) NO_FIREWALL=true; _ARG_SET_NO_FIREWALL="1" ;;
+        --install-whitesur) INSTALL_WHITESUR=true ;;
+        --install-minty) INSTALL_MINTY=true ;;
+        --install-we10x) INSTALL_WE10X=true ;;
+        --install-breeze) INSTALL_BREEZE=true ;;
+        --install-zorin) INSTALL_ZORIN=true ;;
+        --install-moka) INSTALL_MOKA=true ;;
+        --install-numix) INSTALL_NUMIX=true ;;
+        --install-pop) INSTALL_POP=true ;;
+        --install-papirus) INSTALL_PAPIRUS=true ;;
+        --install-brave) INSTALL_BRAVE=true; _BROWSER_ARG_SET="1" ;;
+        --install-vivaldi) INSTALL_VIVALDI=true; _BROWSER_ARG_SET="1" ;;
+        --install-chrome) INSTALL_CHROME=true; _BROWSER_ARG_SET="1" ;;
+        --remove-brave) REMOVE_BRAVE=true; _BROWSER_ARG_SET="1" ;;
+        --remove-vivaldi) REMOVE_VIVALDI=true; _BROWSER_ARG_SET="1" ;;
+        --remove-chrome) REMOVE_CHROME=true; _BROWSER_ARG_SET="1" ;;
+        --install-firefox) INSTALL_FIREFOX=true; _BROWSER_ARG_SET="1" ;;
+        --remove-firefox) REMOVE_FIREFOX=true; _BROWSER_ARG_SET="1" ;;
+        --wallpaper=*) WALLPAPER="${1#*=}"; _ARG_SET_WALLPAPER="1" ;;
+        --install-steam) INSTALL_STEAM=true ;;
+        --install-lutris) INSTALL_LUTRIS=true ;;
+        --install-heroic) INSTALL_HEROIC=true ;;
+        --install-protonup) INSTALL_PROTONUP=true ;;
+        --install-protontricks) INSTALL_PROTONTRICKS=true ;;
+        --install-faugus) INSTALL_FAUGUS=true ;;
+        --install-mangohud) INSTALL_MANGOHUD=true ;;
+        --install-goverlay) INSTALL_GOVERLAY=true ;;
+        --install-gamemode) INSTALL_GAMEMODE=true ;;
+        --default-icon=*) DEFAULT_ICON="${1#*=}"; _ARG_SET_DEFAULT_ICON="1" ;;
+        --reboot) REBOOT=true ;;
+        --force) FORCE_RERUN=true ;;
+        --reset) RESET_STATE=true ;;
+        *) echo "❌ Unbekannter Parameter: $1"; exit 1 ;;
+    esac
+    shift
+done
+
+case "$OFFICE_SUITE" in
+    libreoffice|onlyoffice|abiword|none) ;;
+    *)
+        echo "❌ Ungültiger Wert für --office=: '$OFFICE_SUITE'"
+        echo "   Erlaubt: libreoffice | onlyoffice | abiword | none"
+        exit 1
+        ;;
+esac
+# -----------------------------------------
+
+# =========================================================
+# LIVE-SYSTEM-ERKENNUNG
+# =========================================================
+_is_live=false
+_live_reason=""
+
+if grep -qE '(^| )(boot=casper|boot=live)( |$)' /proc/cmdline 2>/dev/null; then
+    _is_live=true
+    _live_reason="Kernel-Cmdline enthält boot=casper oder boot=live"
+fi
+
+if [[ -d /run/casper ]] || [[ -d /rofs ]] || [[ -d /cow ]]; then
+    _is_live=true
+    _live_reason="Casper/Overlay-Verzeichnisse gefunden (/run/casper, /rofs oder /cow)"
+fi
+
+_root_fs="$(findmnt -n -o FSTYPE / 2>/dev/null || true)"
+if [[ "$_root_fs" == "overlay" ]] || [[ "$_root_fs" == "squashfs" ]]; then
+    _is_live=true
+    _live_reason="Root-Dateisystem ist $_root_fs (typisch für Live-Systeme)"
+fi
+
+if [[ "$_is_live" == "true" ]]; then
+    echo ""
+    echo "════════════════════════════════════════════════════════════"
+    echo "❌  ABBRUCH: Live-System erkannt"
+    echo "════════════════════════════════════════════════════════════"
+    echo ""
+    echo "   Grund: $_live_reason"
+    echo ""
+    echo "   Der Ubuntu-PLUS Transformer installiert sehr viele Pakete"
+    echo "   (mehrere hundert MB). In einer Live-Session liegt das"
+    echo "   Root-Dateisystem vollständig im RAM – das führt zu"
+    echo "   Speichermangel und bricht mittendrin ab."
+    echo ""
+    echo "   ℹ️  Bitte installiere Ubuntu zuerst auf die Festplatte"
+    echo "      und führe den Transformer dann im installierten"
+    echo "      System aus."
+    echo ""
+    echo "════════════════════════════════════════════════════════════"
+    exit 1
+fi
+# =========================================================
+
+# ---------------------------------------------
+# Funktion: dconf-Einstellungen zuverlässig laden
+# ---------------------------------------------
+load_dconf_profile() {
+    local dconf_file="$1"
+    local user="$2"
+
+    if [[ ! -f "$dconf_file" ]]; then
+        echo "❌ dconf-Datei nicht gefunden: $dconf_file"
+        return 1
+    fi
+
+    local user_uid
+    user_uid=$(id -u "$user" 2>/dev/null || echo "")
+    if [[ -z "$user_uid" ]]; then
+        echo "❌ Benutzer $user existiert nicht."
+        return 1
+    fi
+
+    local dbus_socket="/run/user/$user_uid/bus"
+
+    if [[ -S "$dbus_socket" ]]; then
+        echo "   Lade Einstellungen in die aktuelle GNOME-Sitzung ..."
+        if sudo -u "$user" env DBUS_SESSION_BUS_ADDRESS="unix:path=$dbus_socket" \
+                dconf load / < "$dconf_file" 2>/dev/null; then
+            echo "   ✅ Einstellungen erfolgreich übernommen."
+        else
+            echo "   ⚠️ Teilweise Fehler beim Laden (ignoriert)."
+        fi
+    else
+        echo "   ⚠️ Keine aktive GNOME-Sitzung (DBus-Socket nicht gefunden)."
+        echo "   → Die Einstellungen werden für den nächsten Login vorbereitet."
+        local user_home
+        user_home=$(eval echo "~$user")
+        if [[ -d "$user_home" ]]; then
+            cp "$dconf_file" "$user_home/gnome-settings.dconf"
+            chown "$user:$user" "$user_home/gnome-settings.dconf" 2>/dev/null || true
+            echo "   → Datei nach ~/gnome-settings.dconf kopiert (wird beim Login geladen)."
+        fi
+    fi
+}
+# ---------------------------------------------
+
+# ---------------------------------------------
+# Funktion: Icon-Cache aktualisieren
+# ---------------------------------------------
+refresh_icon_cache() {
+    local theme_name="$1"
+    if [[ -z "$theme_name" ]]; then
+        return 0
+    fi
+    if [[ -d "/usr/share/icons/$theme_name" ]]; then
+        gtk-update-icon-cache -f -t "/usr/share/icons/$theme_name" 2>/dev/null || true
+    fi
+}
+# ---------------------------------------------
+
+# =========================================================
+# STATE-FILE-MECHANISMUS
+# =========================================================
+STATE_DIR="/var/lib/ubuntu-plus-transformer"
+STATE_FILE="$STATE_DIR/state.conf"
+
+step() {
+    local key="$1"
+    local desc="$2"
+    if [[ "${!key}" == "1" ]]; then
+        echo ">>> $desc – bereits erledigt, überspringe."
+        return 1
+    fi
+    echo ">>> $desc ..."
+    return 0
+}
+
+step_mark() {
+    local key="$1"
+    printf -v "$key" '%s' 1
+    export "$key"
+}
+
+step_choice() {
+    local key="$1"
+    local desc="$2"
+    local arg_set="$3"
+    local current="$4"
+    local saved="$5"
+
+    if [[ "$arg_set" == "1" ]] && [[ "$current" != "$saved" ]]; then
+        echo ">>> $desc – Nutzerentscheidung geändert: '$saved' → '$current'"
+        return 0
+    fi
+
+    if [[ "${!key}" == "1" ]]; then
+        echo ">>> $desc – bereits erledigt, überspringe."
+        return 1
+    fi
+
+    echo ">>> $desc ..."
+    return 0
+}
+
+state_load() {
+    if [[ ! -f "$STATE_FILE" ]]; then
+        return 0
+    fi
+    echo ">>> State-Datei gefunden – Werte werden geladen."
+    # shellcheck disable=SC1090
+    source "$STATE_FILE"
+}
+
+state_save() {
+    mkdir -p "$STATE_DIR"
+    cat > "$STATE_FILE" <<EOF
+# Ubuntu-PLUS Transformer State
+# Automatisch generiert – nicht manuell bearbeiten
+VERSION=1
+LAST_RUN="$(date '+%Y-%m-%d %H:%M:%S')"
+
+# ─── Nutzerentscheidungen ───
+STATE_OFFICE_SUITE="$OFFICE_SUITE"
+STATE_DEFAULT_ICON="$DEFAULT_ICON"
+STATE_WALLPAPER="$WALLPAPER"
+STATE_NO_GAMES="$NO_GAMES"
+STATE_NO_FIREWALL="$NO_FIREWALL"
+
+# ─── Icon-Themes ───
+STATE_INSTALL_WHITESUR=$INSTALL_WHITESUR
+STATE_INSTALL_MINTY=$INSTALL_MINTY
+STATE_INSTALL_WE10X=$INSTALL_WE10X
+STATE_INSTALL_BREEZE=$INSTALL_BREEZE
+STATE_INSTALL_ZORIN=$INSTALL_ZORIN
+STATE_INSTALL_MOKA=$INSTALL_MOKA
+STATE_INSTALL_NUMIX=$INSTALL_NUMIX
+STATE_INSTALL_POP=$INSTALL_POP
+STATE_INSTALL_PAPIRUS=$INSTALL_PAPIRUS
+
+# ─── Browser ───
+STATE_INSTALL_BRAVE=$INSTALL_BRAVE
+STATE_INSTALL_VIVALDI=$INSTALL_VIVALDI
+STATE_INSTALL_CHROME=$INSTALL_CHROME
+STATE_INSTALL_FIREFOX=$INSTALL_FIREFOX
+STATE_REMOVE_BRAVE=$REMOVE_BRAVE
+STATE_REMOVE_VIVALDI=$REMOVE_VIVALDI
+STATE_REMOVE_CHROME=$REMOVE_CHROME
+STATE_REMOVE_FIREFOX=$REMOVE_FIREFOX
+
+# ─── Gaming ───
+STATE_INSTALL_STEAM=$INSTALL_STEAM
+STATE_INSTALL_LUTRIS=$INSTALL_LUTRIS
+STATE_INSTALL_HEROIC=$INSTALL_HEROIC
+STATE_INSTALL_PROTONUP=$INSTALL_PROTONUP
+STATE_INSTALL_PROTONTRICKS=$INSTALL_PROTONTRICKS
+STATE_INSTALL_FAUGUS=$INSTALL_FAUGUS
+STATE_INSTALL_MANGOHUD=$INSTALL_MANGOHUD
+STATE_INSTALL_GOVERLAY=$INSTALL_GOVERLAY
+STATE_INSTALL_GAMEMODE=$INSTALL_GAMEMODE
+
+# ─── Erledigte Schritte ───
+DONE_APT_BASE=${DONE_APT_BASE:-0}
+DONE_APT_GAMING=${DONE_APT_GAMING:-0}
+DONE_APT_EXTRA=${DONE_APT_EXTRA:-0}
+DONE_CHEESE=${DONE_CHEESE:-0}
+DONE_BROWSER=${DONE_BROWSER:-0}
+DONE_OFFICE=${DONE_OFFICE:-0}
+DONE_NAUTILUS=${DONE_NAUTILUS:-0}
+DONE_EXTRA_DEBS=${DONE_EXTRA_DEBS:-0}
+DONE_MIME=${DONE_MIME:-0}
+DONE_FACES=${DONE_FACES:-0}
+DONE_AVATAR=${DONE_AVATAR:-0}
+DONE_WALLPAPERS=${DONE_WALLPAPERS:-0}
+DONE_BACKGROUNDS=${DONE_BACKGROUNDS:-0}
+DONE_MUSIC=${DONE_MUSIC:-0}
+DONE_GNOME_LAYOUT_DCONF=${DONE_GNOME_LAYOUT_DCONF:-0}
+DONE_ICONS=${DONE_ICONS:-0}
+DONE_BACKUP=${DONE_BACKUP:-0}
+DONE_HIDE_APPS=${DONE_HIDE_APPS:-0}
+DONE_GAMING=${DONE_GAMING:-0}
+DONE_GNOME_SETTINGS=${DONE_GNOME_SETTINGS:-0}
+DONE_DOCS=${DONE_DOCS:-0}
+DONE_FIREFOX_POLICY=${DONE_FIREFOX_POLICY:-0}
+DONE_FIREWALL=${DONE_FIREWALL:-0}
+DONE_FLATPAK=${DONE_FLATPAK:-0}
+DONE_ICON_SET=${DONE_ICON_SET:-0}
+DONE_WALLPAPER_SET=${DONE_WALLPAPER_SET:-0}
+EOF
+    chmod 600 "$STATE_FILE"
+    echo ">>> State gespeichert: $STATE_FILE"
+}
+# =========================================================
+
+if [[ $EUID -ne 0 ]]; then
+    echo "❌ Dieses Skript muss als root ausgeführt werden (sudo)."
+    exit 1
+fi
+
+WORKDIR="/tmp/ubuntu-plus-transformer-$$"
+mkdir -p "$WORKDIR"
+cd "$WORKDIR"
+
+cleanup_full() {
+    cleanup_early
+    rm -rf "$WORKDIR" 2>/dev/null || true
+}
+trap cleanup_full EXIT
+
+REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo $USER)}"
+
+# =========================================================
+# STATE-DATEI LADEN UND MIT ARGUMENTEN VERGLEICHEN
+# =========================================================
+if [[ "$RESET_STATE" == "true" ]]; then
+    if [[ -f "$STATE_FILE" ]]; then
+        rm -f "$STATE_FILE"
+        echo ">>> --reset: State-Datei gelöscht: $STATE_FILE"
+    else
+        echo ">>> --reset: Keine State-Datei vorhanden."
+    fi
+    exit 0
+fi
+
+if [[ "$FORCE_RERUN" == "true" ]]; then
+    if [[ -f "$STATE_FILE" ]]; then
+        rm -f "$STATE_FILE"
+        echo ">>> --force: State-Datei gelöscht, alles wird neu durchlaufen."
+    fi
+fi
+
+state_load
+
+# Nutzerentscheidungen aus State anwenden, wo kein Argument übergeben wurde
+if [[ -z "$_ARG_SET_OFFICE" ]] && [[ -n "$STATE_OFFICE_SUITE" ]]; then
+    OFFICE_SUITE="$STATE_OFFICE_SUITE"
+    echo "   ℹ️  OFFICE_SUITE aus State: $OFFICE_SUITE"
+fi
+if [[ -z "$_ARG_SET_DEFAULT_ICON" ]] && [[ -n "$STATE_DEFAULT_ICON" ]]; then
+    DEFAULT_ICON="$STATE_DEFAULT_ICON"
+    echo "   ℹ️  DEFAULT_ICON aus State: $DEFAULT_ICON"
+fi
+if [[ -z "$_ARG_SET_WALLPAPER" ]] && [[ -n "$STATE_WALLPAPER" ]]; then
+    WALLPAPER="$STATE_WALLPAPER"
+    echo "   ℹ️  WALLPAPER aus State: $WALLPAPER"
+fi
+if [[ -z "$_ARG_SET_NO_GAMES" ]] && [[ -n "$STATE_NO_GAMES" ]]; then
+    NO_GAMES="$STATE_NO_GAMES"
+    echo "   ℹ️  NO_GAMES aus State: $NO_GAMES"
+fi
+if [[ -z "$_ARG_SET_NO_FIREWALL" ]] && [[ -n "$STATE_NO_FIREWALL" ]]; then
+    NO_FIREWALL="$STATE_NO_FIREWALL"
+    echo "   ℹ️  NO_FIREWALL aus State: $NO_FIREWALL"
+fi
+
+# Icon-Themes aus State
+if [[ "$STATE_INSTALL_WHITESUR" == "true" ]]; then INSTALL_WHITESUR=true; fi
+if [[ "$STATE_INSTALL_MINTY" == "true" ]]; then INSTALL_MINTY=true; fi
+if [[ "$STATE_INSTALL_WE10X" == "true" ]]; then INSTALL_WE10X=true; fi
+if [[ "$STATE_INSTALL_BREEZE" == "true" ]]; then INSTALL_BREEZE=true; fi
+if [[ "$STATE_INSTALL_ZORIN" == "true" ]]; then INSTALL_ZORIN=true; fi
+if [[ "$STATE_INSTALL_MOKA" == "true" ]]; then INSTALL_MOKA=true; fi
+if [[ "$STATE_INSTALL_NUMIX" == "true" ]]; then INSTALL_NUMIX=true; fi
+if [[ "$STATE_INSTALL_POP" == "true" ]]; then INSTALL_POP=true; fi
+if [[ "$STATE_INSTALL_PAPIRUS" == "true" ]]; then INSTALL_PAPIRUS=true; fi
+
+# Browser aus State
+if [[ "$STATE_INSTALL_BRAVE" == "true" ]]; then INSTALL_BRAVE=true; fi
+if [[ "$STATE_INSTALL_VIVALDI" == "true" ]]; then INSTALL_VIVALDI=true; fi
+if [[ "$STATE_INSTALL_CHROME" == "true" ]]; then INSTALL_CHROME=true; fi
+if [[ "$STATE_INSTALL_FIREFOX" == "true" ]]; then INSTALL_FIREFOX=true; fi
+if [[ "$STATE_REMOVE_BRAVE" == "true" ]]; then REMOVE_BRAVE=true; fi
+if [[ "$STATE_REMOVE_VIVALDI" == "true" ]]; then REMOVE_VIVALDI=true; fi
+if [[ "$STATE_REMOVE_CHROME" == "true" ]]; then REMOVE_CHROME=true; fi
+if [[ "$STATE_REMOVE_FIREFOX" == "true" ]]; then REMOVE_FIREFOX=true; fi
+
+# Gaming aus State
+if [[ "$STATE_INSTALL_STEAM" == "true" ]]; then INSTALL_STEAM=true; fi
+if [[ "$STATE_INSTALL_LUTRIS" == "true" ]]; then INSTALL_LUTRIS=true; fi
+if [[ "$STATE_INSTALL_HEROIC" == "true" ]]; then INSTALL_HEROIC=true; fi
+if [[ "$STATE_INSTALL_PROTONUP" == "true" ]]; then INSTALL_PROTONUP=true; fi
+if [[ "$STATE_INSTALL_PROTONTRICKS" == "true" ]]; then INSTALL_PROTONTRICKS=true; fi
+if [[ "$STATE_INSTALL_FAUGUS" == "true" ]]; then INSTALL_FAUGUS=true; fi
+if [[ "$STATE_INSTALL_MANGOHUD" == "true" ]]; then INSTALL_MANGOHUD=true; fi
+if [[ "$STATE_INSTALL_GOVERLAY" == "true" ]]; then INSTALL_GOVERLAY=true; fi
+if [[ "$STATE_INSTALL_GAMEMODE" == "true" ]]; then INSTALL_GAMEMODE=true; fi
+# =========================================================
+
+echo "===== Ubuntu-PLUS Transformer – System wird angepasst ====="
+echo "Parameter: NO_GAMES=$NO_GAMES, OFFICE_SUITE=$OFFICE_SUITE, NO_FIREWALL=$NO_FIREWALL"
+echo "Icons: WHITESUR=$INSTALL_WHITESUR, MINTY=$INSTALL_MINTY, WE10X=$INSTALL_WE10X, BREEZE=$INSTALL_BREEZE, ZORIN=$INSTALL_ZORIN, MOKA=$INSTALL_MOKA, NUMIX=$INSTALL_NUMIX, POP=$INSTALL_POP, PAPIRUS=$INSTALL_PAPIRUS"
+echo "Browser installieren: BRAVE=$INSTALL_BRAVE, VIVALDI=$INSTALL_VIVALDI, CHROME=$INSTALL_CHROME, FIREFOX=$INSTALL_FIREFOX"
+echo "Browser entfernen:    BRAVE=$REMOVE_BRAVE, VIVALDI=$REMOVE_VIVALDI, CHROME=$REMOVE_CHROME, FIREFOX=$REMOVE_FIREFOX"
+echo "Wallpaper: ${WALLPAPER:-(aktuelles behalten)}"
+echo "Gaming: STEAM=$INSTALL_STEAM, LUTRIS=$INSTALL_LUTRIS, HEROIC=$INSTALL_HEROIC, PROTONUP=$INSTALL_PROTONUP, PROTONTRICKS=$INSTALL_PROTONTRICKS, FAUGUS=$INSTALL_FAUGUS, MANGOHUD=$INSTALL_MANGOHUD, GOVERLAY=$INSTALL_GOVERLAY, GAMEMODE=$INSTALL_GAMEMODE"
+echo "Yaru ist immer installiert (Ubuntu‑Standard) und wird nicht entfernt."
+echo "Default Icon: $DEFAULT_ICON"
+
+# =========================================================
+# ZEITSYNCHRONISATION
+# =========================================================
+fix_system_time() {
+    echo ">>> Prüfe Systemzeit ..."
+
+    if ! command -v timedatectl &>/dev/null; then
+        echo "   ⚠️ timedatectl nicht gefunden – überspringe Zeitsynchronisation."
+        return 0
+    fi
+
+    echo "   Aktuelle Systemzeit: $(date)"
+
+    local ntp_status
+    ntp_status=$(timedatectl show --property=NTPSynchronized --value 2>/dev/null)
+    if [[ "$ntp_status" == "yes" ]]; then
+        echo "   ✅ NTP ist bereits aktiv und Zeit synchronisiert."
+        return 0
+    fi
+
+    echo "   ⏰ Systemzeit wird korrigiert ..."
+
+    if command -v chronyc &>/dev/null; then
+        echo "   → Führe chronyc makestep aus ..."
+        if chronyc makestep 2>/dev/null; then
+            echo "   ✅ chronyc makestep erfolgreich."
+            sleep 2
+            if timedatectl show --property=NTPSynchronized --value 2>/dev/null | grep -q "yes"; then
+                echo "   ✅ Zeit erfolgreich synchronisiert."
+                echo "   Neue Systemzeit: $(date)"
+                return 0
+            fi
+        fi
+    fi
+
+    echo "   → Versuche direkte NTP-Synchronisation via ntpdate ..."
+    if ! command -v ntpdate &>/dev/null; then
+        echo "   → Installiere ntpdate ..."
+        apt install -y ntpdate 2>/dev/null || true
+    fi
+
+    if command -v ntpdate &>/dev/null; then
+        if ntpdate -u pool.ntp.org 2>/dev/null; then
+            echo "   ✅ Systemzeit über ntpdate synchronisiert."
+            hwclock --systohc 2>/dev/null || true
+            echo "   Neue Systemzeit: $(date)"
+            return 0
+        fi
+    fi
+
+    echo "   → Versuche manuelle Zeitsynchronisation über HTTP ..."
+    local time_server="http://time.google.com"
+    local time_str
+    time_str=$(curl -s --head "$time_server" 2>/dev/null | grep -i "^date:" | sed 's/^[Dd]ate: //')
+    if [[ -z "$time_str" ]]; then
+        time_server="http://www.google.com"
+        time_str=$(curl -s --head "$time_server" 2>/dev/null | grep -i "^date:" | sed 's/^[Dd]ate: //')
+    fi
+
+    if [[ -n "$time_str" ]]; then
+        echo "   📅 Empfangene Zeit: $time_str"
+        local epoch_time
+        epoch_time=$(date -d "$time_str" +%s 2>/dev/null)
+        if [[ -n "$epoch_time" ]]; then
+            echo "   ⏰ Setze Systemzeit auf $epoch_time ..."
+            if date -s "@$epoch_time" >/dev/null 2>&1; then
+                echo "   ✅ Systemzeit manuell gesetzt."
+                hwclock --systohc 2>/dev/null || true
+                timedatectl set-ntp true 2>/dev/null || true
+                echo "   Neue Systemzeit: $(date)"
+                return 0
+            fi
+        fi
+    fi
+
+    echo "   ⚠️ Zeit konnte nicht automatisch synchronisiert werden."
+    echo "   ⚠️ Fahre trotzdem fort, aber APT könnte Probleme machen."
+    return 0
+}
+fix_system_time
+# =========================================================
+
+# ---------------------------------------------
+# Grundlegende Werkzeuge sicherstellen
+# ---------------------------------------------
+if step DONE_APT_BASE "Grundlegende Werkzeuge + System-Update"; then
+echo ">>> Grundlegende Werkzeuge installieren ..."
+apt update -y
+apt install -y wget unzip curl rsync
+
+# ---------------------------------------------
+# CD-ROM-Quelle entfernen (falls vorhanden)
+# ---------------------------------------------
+if grep -q "^deb cdrom:" /etc/apt/sources.list; then
+    echo ">>> CD-ROM-Quelle aus APT-Quellen entfernen ..."
+    sed -i '/cdrom:/d' /etc/apt/sources.list
+    rm -f /etc/apt/sources.list.d/cdrom.list 2>/dev/null || true
+fi
+
+# ---------------------------------------------
+# System aktualisieren
+# ---------------------------------------------
+echo ">>> System aktualisieren ..."
+apt update -y
+apt upgrade -y
+apt dist-upgrade -y
+apt autoremove --purge -y
+apt autoclean -y
+apt clean -y
+
+# ---------------------------------------------
+# 32-Bit-Architektur (nur wenn Gaming aktiv)
+# ---------------------------------------------
+if [[ "$NO_GAMES" != "true" ]]; then
+    echo ">>> 32-Bit-Architektur aktivieren (für Gaming) ..."
+    dpkg --add-architecture i386
+    apt update -y
+else
+    echo ">>> 32-Bit-Architektur wird nicht aktiviert (Gaming deaktiviert)."
+fi
+
+# ---------------------------------------------
+# Treiber und Firmware installieren (immer)
+# ---------------------------------------------
+echo ">>> Treiber und Firmware installieren ..."
+
+if apt-cache policy wireless-tools | grep -q "Candidate:"; then
+    apt install -y \
+        dkms \
+        linux-firmware \
+        wireless-tools \
+        wpasupplicant \
+        bluez-firmware \
+        firmware-ath9k-htc \
+        intel-microcode \
+        amd64-microcode
+else
+    apt install -y \
+        dkms \
+        linux-firmware \
+        wpasupplicant \
+        bluez-firmware \
+        firmware-ath9k-htc \
+        intel-microcode \
+        amd64-microcode
+fi
+
+# ---------------------------------------------
+# Energiemanagement für Laptops (immer)
+# ---------------------------------------------
+echo ">>> Energiemanagement (TLP) installieren ..."
+apt install -y tlp tlp-rdw
+
+# ---------------------------------------------
+# Deutsche Sprache und Tastatur (immer)
+# ---------------------------------------------
+echo ">>> Deutsche Sprache und Tastatur einrichten ..."
+apt install -y language-pack-de
+cat > /etc/default/keyboard << 'KBEOF'
+XKBLAYOUT=de
+XKBVARIANT=
+BACKSPACE=guess
+KBEOF
+locale-gen de_DE.UTF-8
+update-locale LANG=de_DE.UTF-8 LANGUAGE=de_DE:de
+
+# ---------------------------------------------
+# Überflüssige Spiele / Apps entfernen (immer)
+# ---------------------------------------------
+echo ">>> Nicht benötigte Programme entfernen ..."
+apt purge --auto-remove -y gnome-mines aisleriot gnome-mahjongg gnome-sudoku 2>/dev/null || true
+apt purge --auto-remove -y totem* remmina* rhythmbox* mpv* 2>/dev/null || true
+step_mark DONE_APT_BASE
+state_save
+fi
+
+# =============================================
+# Bedingte Installationen (APT)
+# =============================================
+
+if step_choice DONE_APT_GAMING "Gaming-Abhängigkeiten" \
+        "$_ARG_SET_NO_GAMES" "$NO_GAMES" "$STATE_NO_GAMES"; then
+if [[ "$NO_GAMES" != "true" ]]; then
+    echo ">>> Gaming-Abhängigkeiten installieren ..."
+    apt install -y \
+        gamemode \
+        mangohud \
+        mesa-utils \
+        mesa-vulkan-drivers \
+        mesa-vulkan-drivers:i386 \
+        libgl1-mesa-dri:i386 \
+        libvulkan1:i386 \
+        cabextract \
+        p7zip-full
+fi
+step_mark DONE_APT_GAMING
+state_save
+fi
+
+if step DONE_APT_EXTRA "Zusätzliche APT-Pakete"; then
+echo ">>> Zusätzliche APT-Pakete installieren ..."
+apt install -y \
+    mintstick \
+    gnome-tweaks \
+    gnome-contacts \
+    gnome-todo \
+    thunderbird \
+    lame wavpack flac vorbis-tools ffmpeg kid3-cli \
+    ubuntu-restricted-extras libavcodec-extra \
+    p7zip p7zip-full \
+    samba \
+    fonts-liberation fonts-croscore \
+    systemd-zram-generator \
+    preload \
+    ufw gufw \
+    showtime \
+    hardinfo \
+    gnome-maps gnome-weather \
+    timeshift \
+    flatpak \
+    gnome-software gnome-software-plugin-flatpak gnome-software-plugin-snap \
+    yt-dlp \
+    file-roller \
+    lollypop \
+    snapd
+step_mark DONE_APT_EXTRA
+state_save
+fi
+
+if step DONE_CHEESE "Snap: Cheese"; then
+if command -v snap &>/dev/null; then
+    echo "   Warte auf snapd ..."
+    for i in {1..10}; do
+        if snap wait system seed.loaded 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+
+    if ! snap list cheese &>/dev/null 2>&1; then
+        echo "   Installiere Cheese (Webcam-Software) ..."
+        if snap install cheese 2>/dev/null; then
+            echo "   ✅ Cheese installiert."
+        else
+            echo "   ⚠️ Cheese konnte nicht installiert werden – überspringe."
+        fi
+    else
+        echo "   ✅ Cheese ist bereits installiert."
+    fi
+else
+    echo "   ⚠️ snapd nicht verfügbar – überspringe Snap-Installationen."
+fi
+step_mark DONE_CHEESE
+state_save
+fi
+
+if step_choice DONE_BROWSER "Browser-Aktionen" \
+        "$_BROWSER_ARG_SET" "browser" "done"; then
+# ---------------------------------------------
+# Firefox installieren (Snap Priorität, Flatpak Fallback)
+# ---------------------------------------------
+if [[ "$INSTALL_FIREFOX" == "true" ]]; then
+    echo ">>> Firefox wird installiert ..."
+
+    if command -v snap >/dev/null 2>&1; then
+        echo "   → Snap ist verfügbar – installiere Firefox als Snap ..."
+        if snap install firefox 2>/dev/null; then
+            echo "   ✅ Test OK: Firefox (Snap) installiert."
+        else
+            echo "   ⚠️  Snap-Installation fehlgeschlagen – versuche Flatpak ..."
+            if command -v flatpak >/dev/null 2>&1; then
+                flatpak remote-add --if-not-exists flathub \
+                    https://flathub.org/repo/flathub.flatpakrepo 2>/dev/null || true
+                flatpak install -y flathub org.mozilla.firefox
+                if flatpak list --app 2>/dev/null | grep -q "org.mozilla.firefox"; then
+                    echo "   ✅ Test OK: Firefox (Flatpak) installiert."
+                else
+                    echo "   ⚠️  Test fehlgeschlagen: Firefox konnte nicht installiert werden."
+                fi
+            else
+                echo "   ❌ Flatpak ist ebenfalls nicht verfügbar – Firefox kann nicht installiert werden."
+            fi
+        fi
+    else
+        echo "   ℹ️  Snap ist nicht verfügbar – nutze Flatpak als Fallback ..."
+        if command -v flatpak >/dev/null 2>&1; then
+            flatpak remote-add --if-not-exists flathub \
+                https://flathub.org/repo/flathub.flatpakrepo 2>/dev/null || true
+            flatpak install -y flathub org.mozilla.firefox
+            if flatpak list --app 2>/dev/null | grep -q "org.mozilla.firefox"; then
+                echo "   ✅ Test OK: Firefox (Flatpak) installiert."
+            else
+                echo "   ⚠️  Test fehlgeschlagen: Flatpak-Installation nicht gefunden."
+            fi
+        else
+            echo "   ❌ Weder Snap noch Flatpak sind verfügbar – Firefox kann nicht installiert werden."
+        fi
+    fi
+fi
+
+# ---------------------------------------------
+# Firefox entfernen (Snap UND Flatpak)
+# ---------------------------------------------
+if [[ "$REMOVE_FIREFOX" == "true" ]]; then
+    echo ">>> Firefox wird deinstalliert ..."
+
+    FIREFOX_FOUND=false
+
+    if command -v snap >/dev/null 2>&1 && snap list firefox &>/dev/null 2>&1; then
+        FIREFOX_FOUND=true
+        echo "   🗑️  Entferne Firefox Snap (--purge) ..."
+        if snap remove --purge firefox 2>/dev/null; then
+            echo "   ✅ Firefox Snap entfernt."
+        else
+            echo "   ⚠️  Firefox Snap konnte nicht entfernt werden."
+        fi
+
+        if dpkg -l firefox 2>/dev/null | grep -q "^ii"; then
+            echo "   🗑️  Entferne Firefox-Übergangspaket (deb) ..."
+            apt purge -y firefox 2>/dev/null || true
+        fi
+
+        if [[ -d /var/lib/snapd/snap/firefox ]]; then
+            rm -rf /var/lib/snapd/snap/firefox 2>/dev/null || true
+        fi
+    fi
+
+    if command -v flatpak >/dev/null 2>&1 \
+       && flatpak list --app 2>/dev/null | grep -q "org.mozilla.firefox"; then
+        FIREFOX_FOUND=true
+        echo "   🗑️  Entferne Firefox Flatpak (org.mozilla.firefox) ..."
+        if flatpak uninstall -y org.mozilla.firefox 2>/dev/null; then
+            echo "   ✅ Firefox Flatpak entfernt."
+        else
+            flatpak uninstall -y --delete-data org.mozilla.firefox 2>/dev/null || true
+            if flatpak list --app 2>/dev/null | grep -q "org.mozilla.firefox"; then
+                echo "   ⚠️  Firefox Flatpak konnte nicht vollständig entfernt werden."
+            else
+                echo "   ✅ Firefox Flatpak entfernt."
+            fi
+        fi
+    fi
+
+    if [[ "$FIREFOX_FOUND" == "false" ]]; then
+        echo "   ℹ️  Firefox ist weder als Snap noch als Flatpak installiert – nichts zu tun."
+    fi
+fi
+
+# ---------------------------------------------
+# Flathub-Repository früh einrichten
+# ---------------------------------------------
+if command -v flatpak &>/dev/null; then
+    echo ">>> Richte Flathub-Repository ein ..."
+    flatpak remote-add --if-not-exists flathub \
+        https://flathub.org/repo/flathub.flatpakrepo 2>/dev/null || true
+    echo "   ✅ Flathub-Repository verfügbar."
+fi
+
+# =========================================================
+# Browser installieren (Flatpak, Mehrfachauswahl)
+# =========================================================
+install_browser_flatpak() {
+    local name="$1"
+    local app_id="$2"
+
+    echo ">>> Browser: $name wird als Flatpak installiert ..."
+
+    if ! command -v flatpak >/dev/null 2>&1; then
+        echo "   ⚠️  Flatpak ist nicht verfügbar – $name kann nicht installiert werden."
+        return 1
+    fi
+
+    flatpak remote-add --if-not-exists flathub \
+        https://flathub.org/repo/flathub.flatpakrepo 2>/dev/null || true
+
+    flatpak install -y flathub "$app_id"
+
+    if flatpak list --app 2>/dev/null | grep -q "$app_id"; then
+        echo "   ✅ Test OK: $name ($app_id) installiert."
+    else
+        echo "   ⚠️  Test fehlgeschlagen: $app_id nicht in der Flatpak-Liste."
+        return 1
+    fi
+}
+
+remove_browser_flatpak() {
+    local name="$1"
+    local app_id="$2"
+
+    echo ">>> Browser: $name wird deinstalliert ..."
+
+    if ! command -v flatpak >/dev/null 2>&1; then
+        echo "   ⚠️  Flatpak ist nicht verfügbar – $name kann nicht deinstalliert werden."
+        return 1
+    fi
+
+    if ! flatpak list --app 2>/dev/null | grep -q "$app_id"; then
+        echo "   ℹ️  $name ($app_id) ist nicht installiert – nichts zu tun."
+        return 0
+    fi
+
+    if flatpak uninstall -y "$app_id" 2>/dev/null; then
+        if flatpak list --app 2>/dev/null | grep -q "$app_id"; then
+            echo "   ⚠️  $name ist noch in der Flatpak-Liste – versuche --delete-data ..."
+            flatpak uninstall -y --delete-data "$app_id" 2>/dev/null || true
+        fi
+    fi
+
+    if flatpak list --app 2>/dev/null | grep -q "$app_id"; then
+        echo "   ⚠️  Test fehlgeschlagen: $name ($app_id) weiterhin installiert."
+        return 1
+    else
+        echo "   ✅ Test OK: $name wurde entfernt."
+    fi
+}
+
+if [[ "$INSTALL_BRAVE" == "true" ]]; then
+    install_browser_flatpak "Brave" "com.brave.Browser"
+fi
+
+if [[ "$INSTALL_VIVALDI" == "true" ]]; then
+    install_browser_flatpak "Vivaldi" "com.vivaldi.Vivaldi"
+fi
+
+if [[ "$INSTALL_CHROME" == "true" ]]; then
+    install_browser_flatpak "Google Chrome" "com.google.Chrome"
+fi
+
+if [[ "$REMOVE_BRAVE" == "true" ]]; then
+    remove_browser_flatpak "Brave" "com.brave.Browser"
+fi
+
+if [[ "$REMOVE_VIVALDI" == "true" ]]; then
+    remove_browser_flatpak "Vivaldi" "com.vivaldi.Vivaldi"
+fi
+
+if [[ "$REMOVE_CHROME" == "true" ]]; then
+    remove_browser_flatpak "Google Chrome" "com.google.Chrome"
+fi
+
+if [[ "$INSTALL_BRAVE" != "true" && "$INSTALL_VIVALDI" != "true" && "$INSTALL_CHROME" != "true" && "$INSTALL_FIREFOX" != "true" \
+      && "$REMOVE_BRAVE" != "true" && "$REMOVE_VIVALDI" != "true" && "$REMOVE_CHROME" != "true" && "$REMOVE_FIREFOX" != "true" ]]; then
+    echo ">>> Keine Browser-Aktionen ausgewählt."
+fi
+step_mark DONE_BROWSER
+state_save
+fi
+
+# ---------------------------------------------
+# Büro-Software installieren / verwalten
+# ---------------------------------------------
+install_office_suite() {
+    local target="$1"
+    local ver
+
+    local has_libreoffice=false
+    local has_onlyoffice=false
+    local has_abiword=false
+    local has_gnumeric=false
+
+    if command -v libreoffice >/dev/null 2>&1 \
+       || command -v soffice >/dev/null 2>&1 \
+       || dpkg -l 'libreoffice*' 2>/dev/null | grep -q '^ii'; then
+        has_libreoffice=true
+    fi
+
+    if { command -v flatpak >/dev/null 2>&1 \
+         && flatpak list --app 2>/dev/null | grep -q "org.onlyoffice.desktopeditors"; } \
+       || dpkg -l onlyoffice-desktopeditors 2>/dev/null | grep -q '^ii'; then
+        has_onlyoffice=true
+    fi
+
+    if command -v abiword >/dev/null 2>&1 || \
+       { command -v flatpak >/dev/null 2>&1 && flatpak list --app 2>/dev/null | grep -q "com.abisource.AbiWord"; }; then
+        has_abiword=true
+    fi
+
+    if command -v gnumeric >/dev/null 2>&1 || \
+       { command -v flatpak >/dev/null 2>&1 && flatpak list --app 2>/dev/null | grep -q "org.gnumeric.Gnumeric"; }; then
+        has_gnumeric=true
+    fi
+
+    echo ">>> Office-Ziel: $target"
+    echo "   Aktueller Zustand: LibreOffice=$has_libreoffice, ONLYOFFICE=$has_onlyoffice, AbiWord=$has_abiword, Gnumeric=$has_gnumeric"
+
+    if [[ "$target" != "libreoffice" ]] && [[ "$has_libreoffice" == "true" ]]; then
+        echo ">>> Entferne LibreOffice (nicht mehr Ziel-Suite) ..."
+        apt purge -y 'libreoffice*' 2>/dev/null || true
+        apt autoremove -y 2>/dev/null || true
+        echo "   ✅ LibreOffice entfernt."
+    fi
+
+    if [[ "$target" != "onlyoffice" ]] && [[ "$has_onlyoffice" == "true" ]]; then
+        echo ">>> Entferne ONLYOFFICE Desktop Editors ..."
+        if command -v flatpak >/dev/null 2>&1; then
+            flatpak uninstall -y org.onlyoffice.desktopeditors 2>/dev/null || true
+            flatpak uninstall -y --delete-data org.onlyoffice.desktopeditors 2>/dev/null || true
+        fi
+        apt purge -y onlyoffice-desktopeditors 2>/dev/null || true
+        apt autoremove -y 2>/dev/null || true
+        echo "   ✅ ONLYOFFICE entfernt."
+    fi
+
+    if [[ "$target" != "abiword" ]] && [[ "$has_abiword" == "true" || "$has_gnumeric" == "true" ]]; then
+        echo ">>> Entferne AbiWord + Gnumeric ..."
+        apt purge -y abiword gnumeric 2>/dev/null || true
+        apt autoremove -y 2>/dev/null || true
+        if command -v flatpak >/dev/null 2>&1; then
+            flatpak uninstall -y com.abisource.AbiWord 2>/dev/null || true
+            flatpak uninstall -y org.gnumeric.Gnumeric 2>/dev/null || true
+            flatpak uninstall -y --delete-data com.abisource.AbiWord 2>/dev/null || true
+            flatpak uninstall -y --delete-data org.gnumeric.Gnumeric 2>/dev/null || true
+        fi
+        echo "   ✅ AbiWord + Gnumeric entfernt."
+    fi
+
+    case "$target" in
+        libreoffice)
+            if [[ "$has_libreoffice" == "true" ]]; then
+                echo ">>> LibreOffice ist bereits installiert – überspringe Neuinstallation."
+            else
+                echo ">>> Büro-Software: LibreOffice wird installiert ..."
+                apt install -y libreoffice
+                if command -v libreoffice >/dev/null 2>&1 || command -v soffice >/dev/null 2>&1; then
+                    ver=$(libreoffice --version 2>/dev/null | head -n1 || echo "unbekannt")
+                    echo "   ✅ Test OK: $ver"
+                else
+                    echo "   ⚠️  Test fehlgeschlagen: 'libreoffice' nicht im PATH."
+                    return 1
+                fi
+            fi
+            ;;
+
+        onlyoffice)
+            echo ">>> Büro-Software: ONLYOFFICE Desktop Editors wird als Flatpak installiert ..."
+            if ! command -v flatpak >/dev/null 2>&1; then
+                echo "   ⚠️  Flatpak ist nicht verfügbar – ONLYOFFICE kann nicht installiert werden."
+                return 1
+            fi
+            if flatpak list --app 2>/dev/null | grep -q "org.onlyoffice.desktopeditors"; then
+                echo "   ✅ ONLYOFFICE ist bereits installiert – überspringe Neuinstallation."
+            else
+                flatpak remote-add --if-not-exists flathub \
+                    https://flathub.org/repo/flathub.flatpakrepo 2>/dev/null || true
+                flatpak install -y flathub org.onlyoffice.desktopeditors
+                if flatpak list --app 2>/dev/null | grep -q "org.onlyoffice.desktopeditors"; then
+                    echo "   ✅ Test OK: ONLYOFFICE Desktop Editors (Flatpak) installiert."
+                else
+                    echo "   ⚠️  Test fehlgeschlagen: Flatpak-Installation nicht gefunden."
+                    return 1
+                fi
+            fi
+            ;;
+
+        abiword)
+            if command -v gnumeric >/dev/null 2>&1 || \
+               { command -v flatpak >/dev/null 2>&1 && flatpak list --app 2>/dev/null | grep -q "org.gnumeric.Gnumeric"; }; then
+                echo "   ✅ Gnumeric ist bereits installiert – überspringe."
+            else
+                echo ">>> Installiere Gnumeric ..."
+                GNUMERIC_INSTALLED=false
+
+                if apt-cache policy gnumeric 2>/dev/null | grep -q "Candidate:"; then
+                    echo "   → Installiere Gnumeric über APT ..."
+                    if apt install -y gnumeric; then
+                        if command -v gnumeric >/dev/null 2>&1; then
+                            echo "   ✅ Test OK: Gnumeric über APT installiert."
+                            GNUMERIC_INSTALLED=true
+                        fi
+                    fi
+                fi
+
+                if [[ "$GNUMERIC_INSTALLED" != "true" ]]; then
+                    if command -v flatpak >/dev/null 2>&1; then
+                        echo "   → Installiere Gnumeric über Flatpak (Fallback) ..."
+                        flatpak remote-add --if-not-exists flathub \
+                            https://flathub.org/repo/flathub.flatpakrepo 2>/dev/null || true
+                        flatpak install -y flathub org.gnumeric.Gnumeric
+                        if flatpak list --app 2>/dev/null | grep -q "org.gnumeric.Gnumeric"; then
+                            echo "   ✅ Test OK: Gnumeric (Flatpak) installiert."
+                            GNUMERIC_INSTALLED=true
+                        fi
+                    fi
+                fi
+
+                if [[ "$GNUMERIC_INSTALLED" != "true" ]]; then
+                    echo "   ⚠️  Gnumeric konnte nicht installiert werden – AbiWord wird trotzdem versucht."
+                fi
+            fi
+
+            if command -v abiword >/dev/null 2>&1 || \
+               { command -v flatpak >/dev/null 2>&1 && flatpak list --app 2>/dev/null | grep -q "com.abisource.AbiWord"; }; then
+                echo "   ✅ AbiWord ist bereits installiert – überspringe."
+            else
+                echo ">>> Installiere AbiWord ..."
+                if apt-cache policy abiword 2>/dev/null | grep -q "Candidate:"; then
+                    echo "   → Installiere AbiWord über APT ..."
+                    apt install -y abiword
+                    if command -v abiword >/dev/null 2>&1; then
+                        ver=$(abiword --version 2>/dev/null | head -n1 || echo "unbekannt")
+                        echo "   ✅ Test OK: AbiWord ($ver) über APT installiert."
+                    else
+                        echo "   ⚠️  Test fehlgeschlagen: 'abiword' nicht im PATH."
+                        return 1
+                    fi
+                else
+                    echo "   ℹ️  AbiWord ist nicht im APT-Repo – installiere Flatpak-Version ..."
+                    if command -v flatpak >/dev/null 2>&1; then
+                        flatpak remote-add --if-not-exists flathub \
+                            https://flathub.org/repo/flathub.flatpakrepo 2>/dev/null || true
+                        flatpak install -y flathub com.abisource.AbiWord
+                        if flatpak list --app 2>/dev/null | grep -q "com.abisource.AbiWord"; then
+                            echo "   ✅ Test OK: AbiWord (Flatpak) installiert."
+                        else
+                            echo "   ⚠️  Test fehlgeschlagen: Flatpak-Installation nicht gefunden."
+                            return 1
+                        fi
+                    else
+                        echo "   ❌ Flatpak ist nicht verfügbar – AbiWord kann nicht installiert werden."
+                        return 1
+                    fi
+                fi
+            fi
+            ;;
+
+        none)
+            echo ">>> Keine Büro-Software gewünscht."
+            if [[ "$has_libreoffice" == "true" ]] || [[ "$has_onlyoffice" == "true" ]] || [[ "$has_abiword" == "true" ]]; then
+                echo "   (Alle vorhandenen Office-Suiten wurden entfernt)"
+            else
+                echo "   (Es war keine Office-Software installiert)"
+            fi
+            ;;
+
+        *)
+            echo "   ❌ Unbekannte Büro-Suite: '$target' – überspringe."
+            return 1
+            ;;
+    esac
+}
+
+if step_choice DONE_OFFICE "Büro-Software einrichten" \
+        "$_ARG_SET_OFFICE" "$OFFICE_SUITE" "$STATE_OFFICE_SUITE"; then
+install_office_suite "$OFFICE_SUITE"
+step_mark DONE_OFFICE
+state_save
+fi
+
+if step DONE_NAUTILUS "Nautilus-Erweiterungen"; then
+# ---------------------------------------------
+# Nautilus-Erweiterungen (immer)
+# ---------------------------------------------
+echo ">>> Nautilus-Erweiterungen installieren ..."
+apt install -y \
+    nautilus-admin \
+    nautilus-share \
+    gnome-sushi \
+    ffmpegthumbnailer \
+    gtkhash \
+    nautilus-image-converter 2>/dev/null || true
+step_mark DONE_NAUTILUS
+state_save
+fi
+
+# =============================================
+# Ressourcen aus dem Debian-Paket verarbeiten
+# =============================================
+RESOURCE_BASE="/usr/share/ubuntu-plus-transformer"
+
+if step DONE_EXTRA_DEBS "Zusätzliche .deb-Pakete"; then
+EXTRA_DEBS_DIR="$RESOURCE_BASE/extra-debs"
+if [[ -d "$EXTRA_DEBS_DIR" ]] && ls "$EXTRA_DEBS_DIR"/*.deb 1>/dev/null 2>&1; then
+    echo ">>> Installiere zusätzliche .deb-Pakete aus $EXTRA_DEBS_DIR ..."
+    dpkg -i "$EXTRA_DEBS_DIR"/*.deb || true
+    apt install -f -y
+    echo "   Zusätzliche Pakete erfolgreich installiert."
+fi
+step_mark DONE_EXTRA_DEBS
+state_save
+fi
+
+if step DONE_MIME "MIME-Zuordnungen (GNOME Software + gedit)"; then
+###############################################################################################
+echo ">>> Setze GNOME Software als Standard-Software-Center (snap-store bleibt sichtbar) ..."
+if [[ -n "$REAL_USER" ]] && [[ "$REAL_USER" != "root" ]]; then
+    user_uid=$(id -u "$REAL_USER" 2>/dev/null)
+    dbus_socket="/run/user/$user_uid/bus"
+
+    for mime in \
+        x-scheme-handler/appstream \
+        x-scheme-handler/apt \
+        x-scheme-handler/snap \
+        x-scheme-handler/flatpak \
+        application/vnd.debian.binary-package \
+        application/x-deb; do
+        if [[ -S "$dbus_socket" ]]; then
+            sudo -u "$REAL_USER" env DBUS_SESSION_BUS_ADDRESS="unix:path=$dbus_socket" \
+                xdg-mime default org.gnome.Software.desktop "$mime" 2>/dev/null || true
+        else
+            sudo -u "$REAL_USER" xdg-mime default org.gnome.Software.desktop "$mime" 2>/dev/null || true
+        fi
+    done
+
+    echo "   ✅ GNOME Software als Standard-Software-Center registriert."
+fi
+#####################################################################################################
+# Systemweite Zuordnung für .deb-Pakete (gilt für alle Benutzer)
+if [[ -f /usr/share/applications/org.gnome.Software.desktop ]]; then
+    SYSTEM_MIMEAPPS="/etc/xdg/mimeapps.list"
+    touch "$SYSTEM_MIMEAPPS"
+    if ! grep -q "^\[Default Applications\]" "$SYSTEM_MIMEAPPS"; then
+        printf '\n[Default Applications]\n' >> "$SYSTEM_MIMEAPPS"
+    fi
+    for mime in application/vnd.debian.binary-package application/x-deb; do
+        if grep -q "^${mime}=" "$SYSTEM_MIMEAPPS"; then
+            sed -i "s|^${mime}=.*|${mime}=org.gnome.Software.desktop|" "$SYSTEM_MIMEAPPS"
+        else
+            printf '%s=org.gnome.Software.desktop\n' "$mime" >> "$SYSTEM_MIMEAPPS"
+        fi
+    done
+    echo "   ✅ .deb systemweit mit GNOME Software verknüpft."
+fi
+#######################################################################################################
+
+echo ">>> Setze gedit als Standard für Textdateien ..."
+if [[ -n "$REAL_USER" ]] && [[ "$REAL_USER" != "root" ]]; then
+    user_uid=$(id -u "$REAL_USER" 2>/dev/null)
+    dbus_socket="/run/user/$user_uid/bus"
+
+    if [[ -S "$dbus_socket" ]]; then
+        sudo -u "$REAL_USER" env DBUS_SESSION_BUS_ADDRESS="unix:path=$dbus_socket" \
+            xdg-mime default org.gnome.gedit.desktop text/plain 2>/dev/null || true
+
+        for mime in \
+            text/plain \
+            text/markdown \
+            text/x-markdown \
+            application/x-shellscript \
+            application/xml \
+            text/x-python \
+            text/x-csrc \
+            text/x-chdr; do
+            sudo -u "$REAL_USER" env DBUS_SESSION_BUS_ADDRESS="unix:path=$dbus_socket" \
+                xdg-mime default org.gnome.gedit.desktop "$mime" 2>/dev/null || true
+        done
+
+        echo "   ✅ gedit als Standard für Textdateien gesetzt."
+    else
+        sudo -u "$REAL_USER" xdg-mime default org.gnome.gedit.desktop text/plain 2>/dev/null || true
+        echo "   ✅ gedit als Standard für text/plain gesetzt (ohne Session-Bus)."
+    fi
+fi
+#########################################################################################
+step_mark DONE_MIME
+state_save
+fi
+
+# 14b. Avatare (faces)
+if step DONE_FACES "Avatare aus faces/ kopieren"; then
+FACE_SRC="$RESOURCE_BASE/faces"
+if [[ -d "$FACE_SRC" ]]; then
+    if [[ $(find "$FACE_SRC" -maxdepth 1 -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.svg" -o -iname "*.gif" \) 2>/dev/null | wc -l) -gt 0 ]]; then
+        echo ">>> Lösche vorhandene Avatare in /usr/share/pixmaps/faces/ ..."
+        mkdir -p /usr/share/pixmaps/faces
+        rm -f /usr/share/pixmaps/faces/*
+        echo ">>> Kopiere neue Benutzerbilder nach /usr/share/pixmaps/faces/ ..."
+        cp -f "$FACE_SRC"/* /usr/share/pixmaps/faces/ 2>/dev/null || true
+        echo "   Avatare erfolgreich ersetzt."
+    fi
+fi
+step_mark DONE_FACES
+state_save
+fi
+
+# =========================================================
+# 14b-2. Übergangs-Avatar (bis Ubuntu den GNOME-46-Bug fixt)
+# =========================================================
+if step DONE_AVATAR "Übergangs-Avatar setzen"; then
+if [[ -n "$REAL_USER" ]] && [[ "$REAL_USER" != "root" ]]; then
+    AVATAR_SRC="/usr/share/icons/hicolor/256x256/apps/ubuntu-plus-transformer.png"
+
+    if [[ -f "$AVATAR_SRC" ]]; then
+        echo ">>> Setze Übergangs-Avatar ..."
+
+        USER_HOME="$(eval echo ~$REAL_USER)"
+        user_uid=$(id -u "$REAL_USER" 2>/dev/null)
+        AS_ICON="/var/lib/AccountsService/icons/$REAL_USER"
+        AS_USER_FILE="/var/lib/AccountsService/users/$REAL_USER"
+
+        cp -f "$AVATAR_SRC" "$USER_HOME/.face" 2>/dev/null || true
+        chown "$REAL_USER:$REAL_USER" "$USER_HOME/.face" 2>/dev/null || true
+        chmod 644 "$USER_HOME/.face" 2>/dev/null || true
+
+        mkdir -p /var/lib/AccountsService/icons
+        cp -f "$AVATAR_SRC" "$AS_ICON" 2>/dev/null || true
+        chmod 644 "$AS_ICON" 2>/dev/null || true
+        chown root:root "$AS_ICON" 2>/dev/null || true
+
+        mkdir -p "$(dirname "$AS_USER_FILE")"
+        if [[ ! -f "$AS_USER_FILE" ]]; then
+            printf '[User]\nIcon=%s\n' "$AS_ICON" > "$AS_USER_FILE"
+            chmod 600 "$AS_USER_FILE"
+            chown root:root "$AS_USER_FILE"
+        elif grep -q "^Icon=" "$AS_USER_FILE"; then
+            sed -i "s|^Icon=.*|Icon=$AS_ICON|" "$AS_USER_FILE"
+        else
+            printf '[User]\nIcon=%s\n' "$AS_ICON" >> "$AS_USER_FILE"
+        fi
+
+        timeout 10 busctl call org.freedesktop.Accounts \
+            "/org/freedesktop/Accounts/User$user_uid" \
+            org.freedesktop.Accounts.User SetIconFile s "$AS_ICON" \
+            >/dev/null 2>&1 || true
+
+        cp -f "$AVATAR_SRC" /usr/share/pixmaps/faces/ubuntu-plus-transformer.png 2>/dev/null || true
+
+        systemctl restart accounts-daemon 2>/dev/null || true
+        echo "   ✅ Übergangs-Avatar gesetzt."
+    fi
+fi
+step_mark DONE_AVATAR
+state_save
+fi
+
+# =========================================================
+# 14c. Hintergründe
+if step DONE_WALLPAPERS "Hintergründe nach /usr/share/backgrounds/"; then
+WALLPAPER_SRC="$RESOURCE_BASE/Wallpaper"
+if [[ -d "$WALLPAPER_SRC" ]] && ls "$WALLPAPER_SRC"/* 1>/dev/null 2>&1; then
+    echo ">>> Kopiere Hintergründe nach /usr/share/backgrounds/ ..."
+    mkdir -p /usr/share/backgrounds
+    cp -f "$WALLPAPER_SRC"/* /usr/share/backgrounds/
+    echo "   Hintergründe ersetzt."
+fi
+step_mark DONE_WALLPAPERS
+state_save
+fi
+
+# 14d. Hintergrundbilder für Benutzer
+if step DONE_BACKGROUNDS "Hintergrundbilder nach ~/Bilder"; then
+BACKGROUND_SRC="$RESOURCE_BASE/backgrounds"
+if [[ -d "$BACKGROUND_SRC" ]] && find "$BACKGROUND_SRC" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+    echo ">>> Kopiere Hintergrundbilder aus '$BACKGROUND_SRC' nach ~/Bilder ..."
+    mkdir -p /etc/skel/Bilder
+    cp -rf "$BACKGROUND_SRC"/* /etc/skel/Bilder/ 2>/dev/null || true
+    if [[ -n "$REAL_USER" ]] && [[ "$REAL_USER" != "root" ]]; then
+        USER_HOME="$(eval echo ~$REAL_USER)"
+        if [[ -d "$USER_HOME" ]]; then
+            mkdir -p "$USER_HOME/Bilder"
+            cp -rf "$BACKGROUND_SRC"/* "$USER_HOME/Bilder/" 2>/dev/null || true
+            chown -R "$REAL_USER:$REAL_USER" "$USER_HOME/Bilder" 2>/dev/null || true
+            echo "   ✅ Hintergrundbilder für aktuellen Benutzer bereitgestellt."
+        fi
+    fi
+fi
+step_mark DONE_BACKGROUNDS
+state_save
+fi
+
+# 14e. Musik-Ordner
+if step DONE_MUSIC "Musik-Ordner"; then
+MUSIC_SRC="$RESOURCE_BASE/Musik"
+if [[ -d "$MUSIC_SRC" ]] && ls "$MUSIC_SRC"/* 1>/dev/null 2>&1; then
+    echo ">>> Kopiere 'Musik' nach /etc/skel/Musik/ ..."
+    mkdir -p /etc/skel/Musik
+    cp -rf "$MUSIC_SRC"/* /etc/skel/Musik/
+    echo "   Musik-Ordner für neue Benutzer bereitgestellt."
+    if [[ -n "$REAL_USER" ]] && [[ "$REAL_USER" != "root" ]]; then
+        USER_HOME="$(eval echo ~$REAL_USER)"
+        if [[ -d "$USER_HOME" ]]; then
+            mkdir -p "$USER_HOME/Musik"
+            cp -rf "$MUSIC_SRC"/* "$USER_HOME/Musik/"
+            chown -R "$REAL_USER:$REAL_USER" "$USER_HOME/Musik"
+            echo "   Musik-Ordner für aktuellen Benutzer $REAL_USER bereitgestellt."
+        fi
+    fi
+fi
+step_mark DONE_MUSIC
+state_save
+fi
+
+# 14f. GNOME-Layout
+if step DONE_GNOME_LAYOUT_DCONF "GNOME-Layout anwenden"; then
+LAYOUT_FILE="$RESOURCE_BASE/gnome-layout.dconf"
+if [[ -f "$LAYOUT_FILE" ]]; then
+    echo ">>> Setze GNOME-Layout für aktuellen Benutzer ..."
+    if [[ -n "$REAL_USER" ]] && [[ "$REAL_USER" != "root" ]]; then
+        load_dconf_profile "$LAYOUT_FILE" "$REAL_USER"
+    fi
+    mkdir -p /etc/skel/.config/dconf
+    cp "$LAYOUT_FILE" /etc/skel/gnome-layout.dconf
+    if ! grep -q "gnome-layout.dconf" /etc/skel/.profile 2>/dev/null; then
+        cat >> /etc/skel/.profile << 'PROFEOF'
+if [[ -f ~/gnome-layout.dconf ]]; then
+    echo "Lade gespeichertes GNOME-Layout ..."
+    dconf load / < ~/gnome-layout.dconf && rm ~/gnome-layout.dconf
+fi
+PROFEOF
+        echo "   .profile für neue Benutzer wurde erweitert."
+    fi
+fi
+step_mark DONE_GNOME_LAYOUT_DCONF
+state_save
+fi
+
+# =========================================================
+# Icon-Themes
+# =========================================================
+if step DONE_ICONS "Icon-Themes installieren"; then
+echo ">>> WhiteSur Icon Theme installieren ..."
+cd "$WORKDIR"
+wget -q https://github.com/vinceliuice/WhiteSur-icon-theme/archive/refs/heads/master.zip -O whitesur.zip
+unzip -q whitesur.zip
+cd WhiteSur-icon-theme-master
+./install.sh -a
+cd "$WORKDIR"
+refresh_icon_cache "WhiteSur-dark"
+
+echo ">>> Weitere Icon-Themes installieren (nur ausgewählte) ..."
+
+if [[ "$INSTALL_MINTY" == "true" ]]; then
+    echo "   Installiere Mint-Y Icons ..."
+    apt install -y mint-y-icons
+    refresh_icon_cache "Mint-Y"
+fi
+
+if [[ "$INSTALL_WE10X" == "true" ]]; then
+    echo "   Installiere We10X Icons ..."
+    cd "$WORKDIR"
+    wget -q https://github.com/yeyushengfan258/We10X-icon-theme/archive/refs/heads/master.zip -O we10x.zip
+    unzip -q we10x.zip
+    cd We10X-icon-theme-master && ./install.sh && cd "$WORKDIR"
+    refresh_icon_cache "We10X-dark"
+fi
+
+if [[ "$INSTALL_BREEZE" == "true" ]]; then
+    echo "   Installiere Breeze Icons (KDE Plasma) ..."
+    apt install -y breeze-icon-theme
+    refresh_icon_cache "breeze-dark"
+fi
+
+if [[ "$INSTALL_ZORIN" == "true" ]]; then
+    echo ">>> Lade ZorinOS Icon Theme herunter (Version 4.0.8) ..."
+    cd "$WORKDIR"
+    wget -q --timeout=60 -O zorin-icon-themes.deb \
+        https://launchpad.net/~zorinos/+archive/ubuntu/stable/+files/zorin-icon-themes_4.0.8_all.deb
+    if [[ -f "zorin-icon-themes.deb" ]]; then
+        dpkg -i zorin-icon-themes.deb || true
+        apt install -f -y
+        rm -f zorin-icon-themes.deb
+        refresh_icon_cache "ZorinBlue-Dark"
+        refresh_icon_cache "ZorinGrey-Dark"
+        echo "   ✅ ZorinOS Icon Theme 4.0.8 installiert."
+    fi
+    cd /
+fi
+
+if [[ "$INSTALL_MOKA" == "true" ]]; then
+    echo "   Installiere Moka Icons ..."
+    apt install -y moka-icon-theme
+    refresh_icon_cache "Moka"
+fi
+
+if [[ "$INSTALL_NUMIX" == "true" ]]; then
+    echo "   Installiere Numix Icons ..."
+    apt install -y numix-icon-theme
+    refresh_icon_cache "Numix"
+fi
+
+if [[ "$INSTALL_POP" == "true" ]]; then
+    echo "   Installiere Pop Icons ..."
+    apt install -y pop-icon-theme
+    refresh_icon_cache "Pop"
+fi
+
+if [[ "$INSTALL_PAPIRUS" == "true" ]]; then
+    echo "   Installiere Papirus Icons ..."
+    apt install -y papirus-icon-theme
+    refresh_icon_cache "Papirus"
+fi
+
+echo "   Yaru (Ubuntu‑Standard) ist immer verfügbar und wird nicht entfernt."
+
+rm -rf "$WORKDIR"/WhiteSur-icon-theme-master "$WORKDIR"/We10X-icon-theme-master 2>/dev/null || true
+rm -f "$WORKDIR"/*.zip 2>/dev/null || true
+step_mark DONE_ICONS
+state_save
+fi
+
+# =========================================================
+# DESKTOP-BACKUP WIEDERHERSTELLEN
+# =========================================================
+if step DONE_BACKUP "Desktop-Backup wiederherstellen"; then
+echo ">>> Desktop-Backup wiederherstellen ..."
+BACKUP_DIR="$RESOURCE_BASE"
+LATEST_BACKUP=$(find "$BACKUP_DIR" -maxdepth 1 -name "Ubuntu-PLUS-Desktop_*.tar.gz" -type f -printf "%T@ %p\n" 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2-)
+
+if [[ -n "$LATEST_BACKUP" ]] && [[ -f "$LATEST_BACKUP" ]]; then
+    BACKUP_ARCHIVE="$LATEST_BACKUP"
+    echo ">>> Gefunden: $(basename "$BACKUP_ARCHIVE") wird wiederhergestellt ..."
+
+    TEMP_BACKUP="/tmp/desktop-backup-$$"
+    mkdir -p "$TEMP_BACKUP"
+
+    tar -xzf "$BACKUP_ARCHIVE" -C "$TEMP_BACKUP"
+    BACKUP_CONTENT="$TEMP_BACKUP"
+
+    if [[ -n "$REAL_USER" ]] && [[ "$REAL_USER" != "root" ]]; then
+        USER_HOME="$(eval echo ~$REAL_USER)"
+        if [[ -d "$USER_HOME" ]]; then
+            INCLUDE_DIRS=(
+                ".config/autostart" ".local/share/applications" ".local/share/icons"
+                ".icons" ".themes" ".fonts"
+            )
+            for d in "${INCLUDE_DIRS[@]}"; do
+                src="$BACKUP_CONTENT/$d"
+                dst="$USER_HOME/$d"
+                if [[ -d "$src" ]]; then
+                    mkdir -p "$(dirname "$dst")"
+                    rsync -a "$src/" "$dst/"
+                fi
+            done
+
+            EXT_SRC="$BACKUP_CONTENT/gnome-extensions"
+            EXT_DST="$USER_HOME/.local/share/gnome-shell/extensions"
+            if [[ -d "$EXT_SRC" ]]; then
+                mkdir -p "$EXT_DST"
+                rsync -a "$EXT_SRC/" "$EXT_DST/"
+            fi
+
+            WALL_DIR="$BACKUP_CONTENT/wallpaper"
+            if [[ -d "$WALL_DIR" ]]; then
+                BILDER_DIR="$USER_HOME/Bilder"
+                mkdir -p "$BILDER_DIR"
+                if [[ -f "$WALL_DIR/path.txt" ]]; then
+                    WALL_PATH=$(cat "$WALL_DIR/path.txt")
+                    WALL_FILE=$(basename "$WALL_PATH")
+                    if [[ -f "$WALL_DIR/$WALL_FILE" ]]; then
+                        cp "$WALL_DIR/$WALL_FILE" "$BILDER_DIR/"
+                    fi
+                fi
+                if [[ -f "$WALL_DIR/path-dark.txt" ]]; then
+                    WALL_PATH=$(cat "$WALL_DIR/path-dark.txt")
+                    WALL_FILE=$(basename "$WALL_PATH")
+                    if [[ -f "$WALL_DIR/$WALL_FILE" ]]; then
+                        cp "$WALL_DIR/$WALL_FILE" "$BILDER_DIR/"
+                    fi
+                fi
+            fi
+
+            DCONF_FILE="$BACKUP_CONTENT/gnome-settings.dconf"
+            if [[ -f "$DCONF_FILE" ]]; then
+                CURRENT_ICON=$(sudo -u "$REAL_USER" gsettings get org.gnome.desktop.interface icon-theme 2>/dev/null | tr -d "'" || echo "")
+                load_dconf_profile "$DCONF_FILE" "$REAL_USER"
+                if [[ -n "$CURRENT_ICON" ]] && [[ "$CURRENT_ICON" != "''" ]]; then
+                    sudo -u "$REAL_USER" gsettings set org.gnome.desktop.interface icon-theme "$CURRENT_ICON" 2>/dev/null || true
+                fi
+            fi
+
+            if [[ -d "$WALL_DIR" ]]; then
+                if [[ -f "$WALL_DIR/path.txt" ]]; then
+                    WALL_PATH=$(cat "$WALL_DIR/path.txt")
+                    WALL_FILE=$(basename "$WALL_PATH")
+                    if [[ -f "$BILDER_DIR/$WALL_FILE" ]]; then
+                        sudo -u "$REAL_USER" gsettings set org.gnome.desktop.background picture-uri "file://$BILDER_DIR/$WALL_FILE" 2>/dev/null || true
+                    fi
+                fi
+                if [[ -f "$WALL_DIR/path-dark.txt" ]]; then
+                    WALL_PATH=$(cat "$WALL_DIR/path-dark.txt")
+                    WALL_FILE=$(basename "$WALL_PATH")
+                    if [[ -f "$BILDER_DIR/$WALL_FILE" ]]; then
+                        sudo -u "$REAL_USER" gsettings set org.gnome.desktop.background picture-uri-dark "file://$BILDER_DIR/$WALL_FILE" 2>/dev/null || true
+                    fi
+                fi
+                echo "   ✅ Wallpaper aus Backup gesetzt"
+            fi
+            BOOKMARKS_FILE="$USER_HOME/.config/gtk-3.0/bookmarks"
+            if [[ -f "$BOOKMARKS_FILE" ]]; then
+                rm -f "$BOOKMARKS_FILE"
+            fi
+            BOOKMARKS_FILE_GTK4="$USER_HOME/.config/gtk-4.0/bookmarks"
+            if [[ -f "$BOOKMARKS_FILE_GTK4" ]]; then
+                rm -f "$BOOKMARKS_FILE_GTK4"
+            fi
+
+            if [[ -n "$DEFAULT_ICON" ]]; then
+                case "$DEFAULT_ICON" in
+                    whitesur) ICON_NAME="WhiteSur-dark" ;;
+                    minty)    ICON_NAME="Mint-Y" ;;
+                    we10x)    ICON_NAME="We10X-dark" ;;
+                    breeze)   ICON_NAME="breeze-dark" ;;
+                    zorin)    ICON_NAME="ZorinBlue-Dark" ;;
+                    moka)     ICON_NAME="Moka" ;;
+                    numix)    ICON_NAME="Numix" ;;
+                    pop)      ICON_NAME="Pop" ;;
+                    papirus)  ICON_NAME="Papirus" ;;
+                    yaru)     ICON_NAME="Yaru-blue-dark" ;;
+                    *) ICON_NAME="$DEFAULT_ICON" ;;
+                esac
+                user_uid=$(id -u "$REAL_USER" 2>/dev/null)
+                dbus_socket="/run/user/$user_uid/bus"
+                if [[ -S "$dbus_socket" ]]; then
+                    sudo -u "$REAL_USER" env DBUS_SESSION_BUS_ADDRESS="unix:path=$dbus_socket" \
+                        gsettings set org.gnome.desktop.interface icon-theme "$ICON_NAME" 2>/dev/null || true
+                else
+                    sudo -u "$REAL_USER" gsettings set org.gnome.desktop.interface icon-theme "$ICON_NAME" 2>/dev/null || true
+                fi
+            fi
+
+            echo "   Backup für $REAL_USER wiederhergestellt."
+        fi
+    fi
+
+    echo "   Bereite Backup für neue Benutzer vor ..."
+    SKEL_DIR="/etc/skel"
+    for d in "${INCLUDE_DIRS[@]}"; do
+        src="$BACKUP_CONTENT/$d"
+        dst="$SKEL_DIR/$d"
+        if [[ -d "$src" ]]; then
+            mkdir -p "$(dirname "$dst")"
+            rsync -a "$src/" "$dst/"
+        fi
+    done
+    if [[ -d "$EXT_SRC" ]]; then
+        mkdir -p "$SKEL_DIR/.local/share/gnome-shell/extensions"
+        rsync -a "$EXT_SRC/" "$SKEL_DIR/.local/share/gnome-shell/extensions/"
+    fi
+    if [[ -d "$WALL_DIR" ]]; then
+        mkdir -p "$SKEL_DIR/wallpaper"
+        find "$WALL_DIR" -maxdepth 1 -type f ! -name "*.txt" -exec cp {} "$SKEL_DIR/wallpaper/" \;
+    fi
+    if [[ -f "$EXT_LIST_FILE" ]]; then
+        cp "$EXT_LIST_FILE" "$SKEL_DIR/active-extensions.json"
+    fi
+    echo "   Backup für neue Benutzer bereitgestellt."
+
+    rm -rf "$TEMP_BACKUP"
+else
+    echo ">>> Kein Backup (Ubuntu-PLUS-Desktop_*.tar.gz) in $BACKUP_DIR gefunden – überspringe."
+fi
+step_mark DONE_BACKUP
+state_save
+fi
+
+#############################################################################################################
+if step DONE_HIDE_APPS "gnome-text-editor + ImageMagick ausblenden"; then
+echo ">>> Blende gnome-text-editor aus dem App-Grid aus ..."
+if [[ -n "$REAL_USER" ]] && [[ "$REAL_USER" != "root" ]]; then
+    USER_HOME="$(eval echo ~$REAL_USER)"
+    USER_APP_DIR="$USER_HOME/.local/share/applications"
+    mkdir -p "$USER_APP_DIR"
+
+    SRC="/usr/share/applications/org.gnome.TextEditor.desktop"
+    DST="$USER_APP_DIR/org.gnome.TextEditor.desktop"
+
+    if [[ -f "$SRC" ]]; then
+        cp -f "$SRC" "$DST"
+        if ! grep -q "^NoDisplay=true" "$DST"; then
+            sed -i '/^\[Desktop Entry\]/a NoDisplay=true' "$DST"
+        fi
+        chown "$REAL_USER:$REAL_USER" "$DST"
+        sudo -u "$REAL_USER" update-desktop-database "$USER_APP_DIR" 2>/dev/null || true
+        echo "   ✅ gnome-text-editor für $REAL_USER ausgeblendet."
+    else
+        echo "   ℹ️  $SRC nicht gefunden – überspringe."
+    fi
+fi
+
+###############################################################################################
+# 14a-2. ImageMagick 'display' ausblenden
+echo ">>> Blende ImageMagick 'display' aus dem App-Grid aus ..."
+IM_DESKTOPS=$(find /usr/share/applications -maxdepth 1 -type f \
+    \( -name "display-im6*.desktop" -o -name "display-im*.desktop" \) \
+    2>/dev/null || true)
+
+if [[ -n "$IM_DESKTOPS" ]]; then
+    if [[ -n "$REAL_USER" ]] && [[ "$REAL_USER" != "root" ]]; then
+        USER_HOME="$(eval echo ~$REAL_USER)"
+        USER_APP_DIR="$USER_HOME/.local/share/applications"
+        mkdir -p "$USER_APP_DIR"
+
+        while IFS= read -r IM_DESKTOP; do
+            [[ -z "$IM_DESKTOP" ]] && continue
+            DESKTOP_FILE=$(basename "$IM_DESKTOP")
+            cp -f "$IM_DESKTOP" "$USER_APP_DIR/$DESKTOP_FILE"
+            if ! grep -q "^NoDisplay=true" "$USER_APP_DIR/$DESKTOP_FILE"; then
+                sudo -u "$REAL_USER" sed -i '/^\[Desktop Entry\]/a NoDisplay=true' \
+                    "$USER_APP_DIR/$DESKTOP_FILE"
+            fi
+            chown "$REAL_USER:$REAL_USER" "$USER_APP_DIR/$DESKTOP_FILE"
+            echo "   ✅ $DESKTOP_FILE für $REAL_USER ausgeblendet."
+        done <<< "$IM_DESKTOPS"
+
+        sudo -u "$REAL_USER" update-desktop-database "$USER_APP_DIR" 2>/dev/null || true
+    fi
+fi
+step_mark DONE_HIDE_APPS
+state_save
+fi
+
+# =========================================================
+# Gaming-Tools (optional)
+# =========================================================
+if step_choice DONE_GAMING "Gaming-Tools installieren" \
+        "$_ARG_SET_NO_GAMES" "$NO_GAMES" "$STATE_NO_GAMES"; then
+echo ">>> Gaming-Tools installieren ..."
+
+install_gaming_tool() {
+    local tool_name="$1"
+    local install_cmd="$2"
+    echo "   Installiere $tool_name ..."
+    eval "$install_cmd" 2>/dev/null || echo "   ⚠️ Installation von $tool_name fehlgeschlagen."
+}
+
+if [[ "$INSTALL_STEAM" == "true" ]]; then
+    if command -v flatpak &>/dev/null; then
+        install_gaming_tool "Steam" "flatpak install -y flathub com.valvesoftware.Steam"
+    else
+        install_gaming_tool "Steam" "apt install -y steam"
+    fi
+fi
+
+if [[ "$INSTALL_LUTRIS" == "true" ]]; then
+    install_gaming_tool "Lutris" "apt install -y lutris"
+fi
+
+if [[ "$INSTALL_HEROIC" == "true" ]]; then
+    if command -v flatpak &>/dev/null; then
+        install_gaming_tool "Heroic" "flatpak install -y flathub com.heroicgameslauncher.hgl"
+    else
+        install_gaming_tool "Heroic" "apt install -y heroic-games-launcher"
+    fi
+fi
+
+if [[ "$INSTALL_PROTONUP" == "true" ]]; then
+    if command -v flatpak &>/dev/null; then
+        install_gaming_tool "ProtonUp-Qt" "flatpak install -y flathub net.davidotek.pupgui2"
+    else
+        install_gaming_tool "ProtonUp-Qt" "apt install -y protonup-qt"
+    fi
+fi
+
+if [[ "$INSTALL_PROTONTRICKS" == "true" ]]; then
+    if command -v flatpak &>/dev/null; then
+        install_gaming_tool "Protontricks" "flatpak install -y flathub com.github.Matoking.protontricks"
+    else
+        install_gaming_tool "Protontricks" "apt install -y protontricks"
+    fi
+fi
+
+if [[ "$INSTALL_FAUGUS" == "true" ]]; then
+    if command -v flatpak &>/dev/null; then
+        install_gaming_tool "Faugus Launcher" "flatpak install -y flathub io.github.Faugus.faugus-launcher"
+    else
+        echo "   ⚠️ Faugus Launcher nur als Flatpak verfügbar – überspringe."
+    fi
+fi
+
+if [[ "$INSTALL_MANGOHUD" == "true" ]]; then
+    install_gaming_tool "MangoHud" "apt install -y mangohud"
+fi
+
+if [[ "$INSTALL_GOVERLAY" == "true" ]]; then
+    if command -v flatpak &>/dev/null; then
+        install_gaming_tool "GOverlay" "flatpak install -y flathub com.benjamimgois.goverlay"
+    else
+        echo "   ⚠️ GOverlay nur als Flatpak verfügbar – überspringe."
+    fi
+fi
+
+if [[ "$INSTALL_GAMEMODE" == "true" ]]; then
+    install_gaming_tool "GameMode" "apt install -y gamemode"
+fi
+step_mark DONE_GAMING
+state_save
+fi
+
+# =========================================================
+# Systemweite GNOME-Einstellungen
+# =========================================================
+if step DONE_GNOME_SETTINGS "GNOME-Einstellungen + App-Grid"; then
+echo ">>> Systemweite GNOME-Einstellungen anlegen ..."
+mkdir -p /etc/dconf/profile
+cat > /etc/dconf/profile/user << 'PROFDCEOF'
+user-db:user
+system-db:local
+PROFDCEOF
+
+mkdir -p /etc/dconf/db/local.d
+cat > /etc/dconf/db/local.d/01-ubuntu-plus-transformer << 'DBEOF'
+[org/gnome/desktop/interface]
+gtk-theme='Yaru-blue-dark'
+color-scheme='prefer-dark'
+clock-format='24h'
+
+[org/gnome/shell/extensions/dash-to-dock]
+dock-position='BOTTOM'
+autohide=false
+intellihide=true
+extend-height=false
+click-action='minimize'
+
+[org/gnome/nautilus/preferences]
+show-create-link=true
+DBEOF
+
+echo ">>> Richte alphabetisch sortiertes App-Grid ein ..."
+
+mkdir -p /etc/dconf/db/local.d/locks
+
+cat > /etc/dconf/db/local.d/02-app-grid-layout << 'GRIDEOF'
+[org/gnome/desktop/app-folders]
+folder-children=['ce232a6f-5079-4cad-bd4c-6e0127e8d2b7', '7a3db82e-0cef-4282-a459-cac578d76a42', 'ae22ce52-223c-4852-a07a-dcd14ce9066e', '5bdc5dc0-25d8-4c02-86dc-0b6ce3bf5c97', '6c8430d1-d94a-413d-bb79-8938edab1d34', 'e36526a3-93ae-4a9f-b100-902a578c8903', 'bf707945-316a-490a-af55-bb176c986455', '6acf2936-10cf-4674-91fb-72a8973c48e0', 'b88a06d7-8840-42fa-aeb3-c2c0f462b5ab', '7afaf18f-7f28-4631-a70c-6bd329dce162', '017083bd-7b8d-4b0c-96cc-5e540deba538', 'System', '14d577cf-eda7-49d6-94dc-3729f7596107', 'Utilities']
+
+[org/gnome/desktop/app-folders/folders/017083bd-7b8d-4b0c-96cc-5e540deba538]
+apps=['com.heroicgameslauncher.hgl.desktop', 'io.github.Faugus.faugus-launcher.desktop', 'net.lutris.Lutris.desktop', 'com.github.Matoking.protontricks.desktop', 'net.davidotek.pupgui2.desktop', 'com.valvesoftware.Steam.desktop', 'winetricks.desktop', 'org.DolphinEmu.dolphin-emu.desktop', 'org.libretro.RetroArch.desktop', 'org.prismlauncher.PrismLauncher.desktop']
+name='Spiele'
+
+[org/gnome/desktop/app-folders/folders/14d577cf-eda7-49d6-94dc-3729f7596107]
+apps=['nvim.desktop', 'vim.desktop', 'gnome-boxes_gnome-boxes.desktop', 'virt-manager.desktop', 'org.gnome.Boxes.desktop', 'com.jeffser.Alpaca.desktop']
+name='Virtualisierung'
+translate=false
+
+[org/gnome/desktop/app-folders/folders/5bdc5dc0-25d8-4c02-86dc-0b6ce3bf5c97]
+apps=['gimp.desktop', 'org.gnome.Papers.desktop', 'org.gnome.Loupe.desktop', 'org.gnome.eog.desktop', 'org.gnome.Snapshot.desktop', 'org.gnome.Shotwell.desktop', 'kazam.desktop', 'cheese_cheese.desktop', 'be.alexandervanhee.gradia.desktop']
+name='Grafik'
+
+[org/gnome/desktop/app-folders/folders/6acf2936-10cf-4674-91fb-72a8973c48e0]
+apps=['org.gnome.tweaks.desktop', 'com.mattjakeman.ExtensionManager.desktop', 'kernel-manager.desktop', 'kernel-manager.py.desktop', 'ubuntu-transformer.desktop']
+name='Optimieren'
+translate=false
+
+[org/gnome/desktop/app-folders/folders/6c8430d1-d94a-413d-bb79-8938edab1d34]
+apps=['htop.desktop', 'org.gnome.SystemMonitor.desktop', 'org.gnome.PowerStats.desktop', 'org.gnome.Logs.desktop', 'net.nokyan.Resources.desktop', 'yelp.desktop', 'hardinfo2.desktop', 'org.gnome.baobab.desktop', 'org.gnome.Yelp.desktop', 'org.gnome.clocks.desktop', 'org.gnome.Weather.desktop', 'org.gnome.Maps.desktop']
+name='Info'
+translate=false
+
+[org/gnome/desktop/app-folders/folders/7a3db82e-0cef-4282-a459-cac578d76a42]
+apps=['libreoffice-impress.desktop', 'libreoffice-draw.desktop', 'libreoffice-math.desktop', 'libreoffice-writer.desktop', 'libreoffice-calc.desktop', 'libreoffice-startcenter.desktop', 'org.gnome.Calendar.desktop', 'simple-scan.desktop', 'org.gnome.Calculator.desktop', 'org.gnome.Contacts.desktop', 'org.gnome.Todo.desktop', 'org.gnome.Evince.desktop', 'libreoffice-base.desktop', 'org.onlyoffice.desktopeditors.desktop', 'com.abisource.AbiWord.desktop', 'org.libreoffice.LibreOffice.base.desktop', 'org.libreoffice.LibreOffice.calc.desktop', 'org.libreoffice.LibreOffice.draw.desktop', 'org.libreoffice.LibreOffice.impress.desktop', 'org.libreoffice.LibreOffice.math.desktop', 'org.libreoffice.LibreOffice.writer.desktop', 'org.libreoffice.LibreOffice.desktop']
+name='Büro'
+
+[org/gnome/desktop/app-folders/folders/7afaf18f-7f28-4631-a70c-6bd329dce162]
+apps=['timeshift-gtk.desktop', 'guideos-browser-mail-backup-tool.desktop', 'org.gnome.DejaDup.desktop', 'org.gnome.World.PikaBackup.desktop', 'ubuntu-plus-desktop-sicherung.desktop', 'create-desktop-files.desktop', 'rikus-mintshot.desktop', 'rikus-snapshot.desktop']
+name='Sicherung'
+translate=false
+
+[org/gnome/desktop/app-folders/folders/System]
+apps=['nm-connection-editor.desktop', 'org.gnome.DiskUtility.desktop', 'im-config.desktop', 'org.gnome.Sysprof.desktop', 'usb-creator-gtk.desktop', 'gparted.desktop', 'org.gnome.FileRoller.desktop', 'guideos-stop-tool.desktop', 'gnome-session-properties.desktop', 'org.gnome.Terminal.desktop', 'ubuntu-pro-aktivator.desktop', 'org.gnome.Ptyxis.desktop', 'freigaben-manager.desktop', 'balena-etcher.desktop', 'distroClone.desktop', 'gnome-boxes-tool.desktop', 'guideos-shutdown-tool.desktop', 'mintstick.desktop', 'mintstick-format.desktop']
+name='System'
+translate=false
+
+[org/gnome/desktop/app-folders/folders/Utilities]
+apps=['org.gnome.font-viewer.desktop', 'gnome-language-selector.desktop', 'org.gnome.Characters.desktop', 'org.gnome.gedit.desktop', 'display-im7.q16.desktop', 'gdebi.desktop', 'guideos-erinnerungs-timer.desktop', 'wasserzeichen.desktop', 'guideos-wlan-qr.desktop', 'slicer-next-tool.desktop', 'guideos-usb-werkzeug.desktop', 'yad-icon-browser.desktop']
+name='Zubehör'
+translate=false
+
+[org/gnome/desktop/app-folders/folders/ae22ce52-223c-4852-a07a-dcd14ce9066e]
+apps=['transmission-gtk.desktop', 'org.localsend.localsend_app.desktop', 'com.rustdesk.RustDesk.desktop', 'com.transmissionbt.Transmission.desktop', 'org.filezillaproject.Filezilla.desktop']
+name='Datentausch & Remote'
+translate=false
+
+[org/gnome/desktop/app-folders/folders/b88a06d7-8840-42fa-aeb3-c2c0f462b5ab]
+apps=['desktop-security-center_desktop-security-center.desktop', 'org.gnome.seahorse.Application.desktop', 'com.bitwarden.desktop.desktop', 'com.github.tchx84.Flatseal.desktop', 'guideos-adblocker-tool.desktop', 'guideos-daten-tresor.desktop', 'gufw.desktop', 'org.gtkhash.gtkhash.desktop', 'guideos-data-vault.desktop']
+name='Sicherheit'
+translate=false
+
+[org/gnome/desktop/app-folders/folders/bf707945-316a-490a-af55-bb176c986455]
+apps=['vlc.desktop', 'spotify_spotify.desktop', 'com.github.unrud.VideoDownloader.desktop', 'org.clementine_player.Clementine.desktop', 'media-werkzeug.desktop', 'org.gnome.Showtime.desktop', 'de.haeckerfelix.Shortwave.desktop', 'org.gnome.Lollypop.desktop', 'helga-player.desktop', 'helga-ripper.desktop', 'org.gnome.Rhythmbox3.desktop', 'kazam.desktop', 'io.github.celluloid_player.Celluloid.desktop']
+name='Multimedia'
+
+[org/gnome/desktop/app-folders/folders/ce232a6f-5079-4cad-bd4c-6e0127e8d2b7]
+apps=['software-properties-gtk.desktop', 'snap-store_snap-store.desktop', 'org.gnome.Software.desktop', 'update-manager.desktop', 'ubuntu-plus-app-store.desktop', 'firmware-updater_firmware-updater.desktop']
+name='Aktualisieren & Updates'
+translate=false
+
+[org/gnome/desktop/app-folders/folders/e36526a3-93ae-4a9f-b100-902a578c8903]
+apps=['torbrowser.desktop', 'torbrowser-settings.desktop', 'com.rtosta.zapzap.desktop', 'filezilla.desktop', 'virtualbox.desktop', 'com.brave.Browser.desktop', 'webapp-guideosde.desktop', 'org.torproject.torbrowser-launcher.settings.desktop', 'org.torproject.torbrowser-launcher.desktop', 'thunderbird_thunderbird.desktop', 'firefox_firefox.desktop', 'org.ferdium.Ferdium.desktop', 'guideos-webapp.desktop', 'net.codelogistics.webapps.desktop', 'guideos-browser-mail-backup.desktop', 'com.google.Chrome.desktop', 'webapp-Spotify.desktop', 'webapp-spotifyde.desktop']
+name='Internet'
+
+[org/gnome/shell]
+app-picker-layout=[{'ce232a6f-5079-4cad-bd4c-6e0127e8d2b7': <{'position': <0>}>, '7a3db82e-0cef-4282-a459-cac578d76a42': <{'position': <1>}>, 'ae22ce52-223c-4852-a07a-dcd14ce9066e': <{'position': <2>}>, '5bdc5dc0-25d8-4c02-86dc-0b6ce3bf5c97': <{'position': <3>}>, '6c8430d1-d94a-413d-bb79-8938edab1d34': <{'position': <4>}>, 'e36526a3-93ae-4a9f-b100-902a578c8903': <{'position': <5>}>, 'bf707945-316a-490a-af55-bb176c986455': <{'position': <6>}>, '6acf2936-10cf-4674-91fb-72a8973c48e0': <{'position': <7>}>, 'b88a06d7-8840-42fa-aeb3-c2c0f462b5ab': <{'position': <8>}>, '7afaf18f-7f28-4631-a70c-6bd329dce162': <{'position': <9>}>, '017083bd-7b8d-4b0c-96cc-5e540deba538': <{'position': <10>}>, 'System': <{'position': <11>}>, '14d577cf-eda7-49d6-94dc-3729f7596107': <{'position': <12>}>, 'Utilities': <{'position': <13>}>}]
+GRIDEOF
+
+cat > /etc/dconf/db/local.d/locks/02-app-grid-layout << 'GRIDLOCKEOF'
+/org/gnome/desktop/app-folders/folder-children
+/org/gnome/shell/app-picker-layout
+GRIDLOCKEOF
+
+echo "   ✅ App-Grid mit vordefiniertem Startlayout eingerichtet."
+
+echo ">>> dconf-Datenbank aktualisieren ..."
+if command -v dconf &>/dev/null; then
+    dconf update || echo "   (dconf update nicht möglich – übersprungen)"
+fi
+
+# ─────────────────────────────────────────────
+# Live-Reload der laufenden GNOME-Sitzung
+# ─────────────────────────────────────────────
+echo ">>> Wende App-Grid live auf die laufende GNOME-Sitzung an ..."
+if [[ -n "$REAL_USER" ]] && [[ "$REAL_USER" != "root" ]]; then
+    user_uid=$(id -u "$REAL_USER" 2>/dev/null)
+    dbus_socket="/run/user/$user_uid/bus"
+
+    if [[ -S "$dbus_socket" ]]; then
+        _lock_file="/etc/dconf/db/local.d/locks/02-app-grid-layout"
+        _lock_bak=""
+        if [[ -f "$_lock_file" ]]; then
+            _lock_bak="$(cat "$_lock_file")"
+            rm -f "$_lock_file"
+            dconf update 2>/dev/null || true
+        fi
+
+        sudo -u "$REAL_USER" env DBUS_SESSION_BUS_ADDRESS="unix:path=$dbus_socket" \
+            dconf reset /org/gnome/desktop/app-folders/folder-children 2>/dev/null || true
+        sudo -u "$REAL_USER" env DBUS_SESSION_BUS_ADDRESS="unix:path=$dbus_socket" \
+            dconf reset /org/gnome/shell/app-picker-layout 2>/dev/null || true
+        sudo -u "$REAL_USER" env DBUS_SESSION_BUS_ADDRESS="unix:path=$dbus_socket" \
+            dconf reset /org/gnome/shell/favorite-apps 2>/dev/null || true
+
+        _folder_children="['ce232a6f-5079-4cad-bd4c-6e0127e8d2b7', '7a3db82e-0cef-4282-a459-cac578d76a42', 'ae22ce52-223c-4852-a07a-dcd14ce9066e', '5bdc5dc0-25d8-4c02-86dc-0b6ce3bf5c97', '6c8430d1-d94a-413d-bb79-8938edab1d34', 'e36526a3-93ae-4a9f-b100-902a578c8903', 'bf707945-316a-490a-af55-bb176c986455', '6acf2936-10cf-4674-91fb-72a8973c48e0', 'b88a06d7-8840-42fa-aeb3-c2c0f462b5ab', '7afaf18f-7f28-4631-a70c-6bd329dce162', '017083bd-7b8d-4b0c-96cc-5e540deba538', 'System', '14d577cf-eda7-49d6-94dc-3729f7596107', 'Utilities']"
+
+        _app_picker="[{'ce232a6f-5079-4cad-bd4c-6e0127e8d2b7': <{'position': <0>}>, '7a3db82e-0cef-4282-a459-cac578d76a42': <{'position': <1>}>, 'ae22ce52-223c-4852-a07a-dcd14ce9066e': <{'position': <2>}>, '5bdc5dc0-25d8-4c02-86dc-0b6ce3bf5c97': <{'position': <3>}>, '6c8430d1-d94a-413d-bb79-8938edab1d34': <{'position': <4>}>, 'e36526a3-93ae-4a9f-b100-902a578c8903': <{'position': <5>}>, 'bf707945-316a-490a-af55-bb176c986455': <{'position': <6>}>, '6acf2936-10cf-4674-91fb-72a8973c48e0': <{'position': <7>}>, 'b88a06d7-8840-42fa-aeb3-c2c0f462b5ab': <{'position': <8>}>, '7afaf18f-7f28-4631-a70c-6bd329dce162': <{'position': <9>}>, '017083bd-7b8d-4b0c-96cc-5e540deba538': <{'position': <10>}>, 'System': <{'position': <11>}>, '14d577cf-eda7-49d6-94dc-3729f7596107': <{'position': <12>}>, 'Utilities': <{'position': <13>}>}]"
+
+        _fav_apps="['de.ubuntuplus.flatstore.desktop', 'org.gnome.Settings.desktop', 'org.gnome.Todo.desktop', 'org.gnome.Contacts.desktop', 'org.libreoffice.LibreOffice.desktop', 'thunderbird_thunderbird.desktop', 'org.torproject.torbrowser-launcher.desktop', 'com.brave.Browser.desktop', 'com.vivaldi.Vivaldi.desktop', 'com.google.Chrome.desktop', 'firefox_firefox.desktop', 'org.mozilla.firefox.desktop', 'org.gnome.Nautilus.desktop']"
+
+        sudo -u "$REAL_USER" env DBUS_SESSION_BUS_ADDRESS="unix:path=$dbus_socket" \
+            gsettings set org.gnome.desktop.app-folders folder-children "$_folder_children" 2>/dev/null || true
+
+        sudo -u "$REAL_USER" env DBUS_SESSION_BUS_ADDRESS="unix:path=$dbus_socket" \
+            gsettings set org.gnome.shell app-picker-layout "$_app_picker" 2>/dev/null || true
+
+        sudo -u "$REAL_USER" env DBUS_SESSION_BUS_ADDRESS="unix:path=$dbus_socket" \
+            gsettings set org.gnome.shell favorite-apps "$_fav_apps" 2>/dev/null || true
+
+        if [[ -n "$_lock_bak" ]]; then
+            printf '%s\n' "$_lock_bak" > "$_lock_file"
+            dconf update 2>/dev/null || true
+        fi
+
+        echo "   ✅ App-Grid und Dock live aktualisiert – kein Logout nötig."
+    else
+        echo "   ℹ️  Keine aktive GNOME-Sitzung – Werte greifen beim nächsten Login."
+    fi
+fi
+# ─────────────────────────────────────────────
+
+echo ">>> Stelle sicher, dass das Dock aktiviert ist ..."
+if [[ -n "$REAL_USER" ]] && [[ "$REAL_USER" != "root" ]]; then
+    if command -v gnome-extensions &>/dev/null; then
+        sudo -u "$REAL_USER" gnome-extensions enable ubuntu-dock@ubuntu.com 2>/dev/null || true
+        sudo -u "$REAL_USER" gnome-extensions enable dash-to-dock@micxgx.gmail.com 2>/dev/null || true
+    fi
+fi
+
+echo ">>> Nautilus: 'System' (Root) in der Seitenleiste hinzufügen ..."
+if [[ -n "$REAL_USER" ]] && [[ "$REAL_USER" != "root" ]]; then
+    USER_HOME="$(eval echo ~$REAL_USER)"
+    if [[ -d "$USER_HOME" ]]; then
+        if sudo -u "$REAL_USER" gsettings list-schemas 2>/dev/null | grep -q "^org.gnome.nautilus$"; then
+            if sudo -u "$REAL_USER" gsettings list-keys org.gnome.nautilus 2>/dev/null | grep -q "^bookmarks$"; then
+                CURRENT_BOOKMARKS=$(sudo -u "$REAL_USER" gsettings get org.gnome.nautilus bookmarks 2>/dev/null || echo "[]")
+                if ! echo "$CURRENT_BOOKMARKS" | grep -q "'file:///'"; then
+                    if [[ "$CURRENT_BOOKMARKS" == "[]" ]] || [[ "$CURRENT_BOOKMARKS" == "@as []" ]]; then
+                        sudo -u "$REAL_USER" gsettings set org.gnome.nautilus bookmarks "['file:///','System']"
+                    else
+                        NEW_BOOKMARKS=$(echo "$CURRENT_BOOKMARKS" | sed "s/]/, 'file:///','System' ]/")
+                        sudo -u "$REAL_USER" gsettings set org.gnome.nautilus bookmarks "$NEW_BOOKMARKS"
+                    fi
+                fi
+            fi
+        fi
+    fi
+fi
+step_mark DONE_GNOME_SETTINGS
+state_save
+fi
+
+# =========================================================
+# DOKUMENTENVORLAGEN
+# =========================================================
+if step DONE_DOCS "Dokumentenvorlagen"; then
+echo ">>> Dokumentenvorlagen für neue Benutzer anlegen ..."
+
+mkdir -p /etc/skel/Vorlagen
+
+touch /etc/skel/Vorlagen/Neues\ Text\ Dokument.txt
+touch /etc/skel/Vorlagen/Neues\ Word\ Dokument.docx
+touch /etc/skel/Vorlagen/Neues\ LibreOffice\ Dokument.odt
+touch /etc/skel/Vorlagen/Leere\ Präsentation.odp
+touch /etc/skel/Vorlagen/Leere\ Tabelle.ods
+
+cat > /etc/skel/Vorlagen/Neues\ Python\ Projekt.py << 'PYEOF'
+#! /usr/bin/env python3
+# Dein Python-Skript hier
+PYEOF
+chmod 755 /etc/skel/Vorlagen/Neues\ Python\ Projekt.py
+
+cat > /etc/skel/Vorlagen/Neues\ Bash\ Skript.sh << 'BASHEOF'
+#! /bin/bash
+# Dein Bash-Skript hier
+BASHEOF
+chmod 755 /etc/skel/Vorlagen/Neues\ Bash\ Skript.sh
+
+touch /etc/skel/Vorlagen/Neue\ README.md
+
+cat > /etc/skel/Vorlagen/Neue\ Webseite.html << 'HTMLEOF'
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Neue Webseite</title>
+</head>
+<body>
+    <h1>Hallo Welt!</h1>
+</body>
+</html>
+HTMLEOF
+
+echo "snap" > /etc/skel/.hidden
+echo "Vorlagen" >> /etc/skel/.hidden
+echo "dconf-backup" >> /etc/skel/.hidden
+
+if [[ -n "$REAL_USER" ]] && [[ "$REAL_USER" != "root" ]]; then
+    USER_HOME="$(eval echo ~$REAL_USER)"
+    if [[ -d "$USER_HOME" ]]; then
+        mkdir -p "$USER_HOME/Vorlagen"
+        cp -rf /etc/skel/Vorlagen/* "$USER_HOME/Vorlagen/" 2>/dev/null || true
+
+        HIDDEN_FILE="$USER_HOME/.hidden"
+        if [[ ! -f "$HIDDEN_FILE" ]]; then
+            echo "snap" > "$HIDDEN_FILE"
+            echo "Vorlagen" >> "$HIDDEN_FILE"
+            echo "dconf-backup" >> "$HIDDEN_FILE"
+        else
+            grep -qxF "snap" "$HIDDEN_FILE" || echo "snap" >> "$HIDDEN_FILE"
+            grep -qxF "Vorlagen" "$HIDDEN_FILE" || echo "Vorlagen" >> "$HIDDEN_FILE"
+            grep -qxF "dconf-backup" "$HIDDEN_FILE" || echo "dconf-backup" >> "$HIDDEN_FILE"
+        fi
+
+        chown -R "$REAL_USER:$REAL_USER" "$USER_HOME/Vorlagen" "$HIDDEN_FILE" 2>/dev/null || true
+    fi
+fi
+step_mark DONE_DOCS
+state_save
+fi
+
+# ---------------------------------------------
+# Firefox-Policies
+# ---------------------------------------------
+if step DONE_FIREFOX_POLICY "Firefox-Policies"; then
+echo ">>> Firefox konfigurieren ..."
+mkdir -p /etc/firefox/policies/
+cat > /etc/firefox/policies/policies.json << 'FFEOF'
+{
+  "policies": {
+    "ExtensionSettings": {
+      "uBlock0@raymondhill.net": {
+        "installation_mode": "force_installed",
+        "install_url": "https://addons.mozilla.org/firefox/downloads/latest/ublock-origin/latest.xpi"
+      }
+    },
+    "Homepage": {
+      "URL": "https://linuxguides.de",
+      "StartPage": "homepage"
+    },
+    "Bookmarks": [
+      {
+        "Title": "Linux Guides Forum",
+        "URL": "https://forum.linuxguides.de"
+      }
+    ]
+  }
+}
+FFEOF
+
+if [[ -d /var/snap/firefox ]] || snap list firefox &>/dev/null 2>&1; then
+    echo "   → Hinterlege Firefox-Policies auch für die Snap-Version ..."
+    mkdir -p /var/snap/firefox/common/.mozilla/firefox/policies/
+    cp -f /etc/firefox/policies/policies.json \
+          /var/snap/firefox/common/.mozilla/firefox/policies/policies.json 2>/dev/null || true
+    echo "   ✅ Snap-Firefox-Policies hinterlegt."
+fi
+step_mark DONE_FIREFOX_POLICY
+state_save
+fi
+
+# ---------------------------------------------
+# Firewall aktivieren
+# ---------------------------------------------
+if step_choice DONE_FIREWALL "Firewall (UFW)" \
+        "$_ARG_SET_NO_FIREWALL" "$NO_FIREWALL" "$STATE_NO_FIREWALL"; then
+if [[ "$NO_FIREWALL" != "true" ]]; then
+    echo ">>> Firewall (UFW) aktivieren ..."
+    ufw --force enable
+    ufw default deny incoming
+    ufw default allow outgoing
+fi
+step_mark DONE_FIREWALL
+state_save
+fi
+
+# =============================================
+# FLATPAK-INSTALLATION (GANZ AM ENDE)
+# =============================================
+if step DONE_FLATPAK "Flatpak-Installationen + Theme-Overrides"; then
+echo ">>> Flatpak einrichten ..."
+flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+
+echo ">>> Weitere Flatpaks installieren ..."
+flatpak install -y flathub \
+    de.haeckerfelix.Shortwave \
+    com.github.micahflee.torbrowser-launcher \
+    com.mattjakeman.ExtensionManager \
+    org.gtk.Gtk3theme.Adwaita-dark \
+    org.localsend.localsend_app \
+    com.bitwarden.desktop \
+    com.rustdesk.RustDesk \
+    net.codelogistics.webapps \
+    com.github.tchx84.Flatseal \
+    com.github.unrud.VideoDownloader
+
+echo ">>> Flatpak-Theme für Benutzer $REAL_USER konfigurieren (GTK und Qt) ..."
+if [[ -n "$REAL_USER" ]] && [[ "$REAL_USER" != "root" ]]; then
+    sudo -u "$REAL_USER" flatpak override --user --env=GTK_THEME=Adwaita-dark 2>/dev/null || true
+    sudo -u "$REAL_USER" flatpak override --user --env=QT_STYLE_OVERRIDE=Adwaita-dark 2>/dev/null || true
+    sudo -u "$REAL_USER" flatpak override --user --env=QT_QPA_PLATFORMTHEME=gtk3 2>/dev/null || true
+    echo "   ✅ Flatpak-Theme-Overrides für $REAL_USER gesetzt."
+else
+    echo "   ⚠️  Kein gültiger REAL_USER – Flatpak-Overrides übersprungen."
+fi
+step_mark DONE_FLATPAK
+state_save
+fi
+
+# =============================================
+# Standard-Icon-Theme setzen
+# =============================================
+if step_choice DONE_ICON_SET "Standard-Icon-Theme setzen" \
+        "$_ARG_SET_DEFAULT_ICON" "$DEFAULT_ICON" "$STATE_DEFAULT_ICON"; then
+if [[ -n "$DEFAULT_ICON" ]]; then
+    echo ">>> Setze Standard-Icon-Set auf: $DEFAULT_ICON"
+    case "$DEFAULT_ICON" in
+        whitesur) ICON_NAME="WhiteSur-dark" ;;
+        minty)    ICON_NAME="Mint-Y" ;;
+        we10x)    ICON_NAME="We10X-dark" ;;
+        breeze)   ICON_NAME="breeze-dark" ;;
+        zorin)    ICON_NAME="ZorinBlue-Dark" ;;
+        moka)     ICON_NAME="Moka" ;;
+        numix)    ICON_NAME="Numix" ;;
+        pop)      ICON_NAME="Pop" ;;
+        papirus)  ICON_NAME="Papirus" ;;
+        yaru)     ICON_NAME="Yaru-blue-dark" ;;
+        *) ICON_NAME="$DEFAULT_ICON" ;;
+    esac
+
+    # ─── Validierung: existiert das Theme wirklich? ───
+    USER_HOME_REAL="$(eval echo ~$REAL_USER)"
+    if [[ ! -d "/usr/share/icons/$ICON_NAME" ]] \
+       && [[ ! -d "$USER_HOME_REAL/.local/share/icons/$ICON_NAME" ]] \
+       && [[ ! -d "$USER_HOME_REAL/.icons/$ICON_NAME" ]]; then
+        echo "   ⚠️  Theme '$ICON_NAME' nicht gefunden – Fallback auf 'Yaru'"
+        ICON_NAME="Yaru"
+    else
+        echo "   ✅ Theme '$ICON_NAME' vorhanden."
+    fi
+
+    # ─── Icon-Cache auffrischen ───
+    if [[ -d "/usr/share/icons/$ICON_NAME" ]]; then
+        echo "   → Aktualisiere Icon-Cache für '$ICON_NAME' ..."
+        gtk-update-icon-cache -f -t "/usr/share/icons/$ICON_NAME" 2>/dev/null || true
+    fi
+    if [[ -d /usr/share/icons/hicolor ]]; then
+        gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
+    fi
+
+    # ─── Theme setzen ───
+    if [[ -n "$REAL_USER" ]] && [[ "$REAL_USER" != "root" ]]; then
+        user_uid=$(id -u "$REAL_USER" 2>/dev/null)
+        dbus_socket="/run/user/$user_uid/bus"
+        if [[ -S "$dbus_socket" ]]; then
+            sudo -u "$REAL_USER" env DBUS_SESSION_BUS_ADDRESS="unix:path=$dbus_socket" \
+                gsettings set org.gnome.desktop.interface icon-theme "$ICON_NAME" 2>/dev/null || true
+        else
+            sudo -u "$REAL_USER" gsettings set org.gnome.desktop.interface icon-theme "$ICON_NAME" 2>/dev/null || true
+        fi
+        echo "   ✅ Icon-Theme auf '$ICON_NAME' gesetzt."
+    fi
+
+    # ─── Nautilus neu laden, damit Icons sofort sichtbar sind ───
+    if pgrep -u "$REAL_USER" nautilus >/dev/null 2>&1; then
+        echo "   → Lade Nautilus neu (Icon-Refresh) ..."
+        sudo -u "$REAL_USER" nautilus -q 2>/dev/null || true
+        sleep 1
+    fi
+fi
+step_mark DONE_ICON_SET
+state_save
+fi
+
+# =============================================
+# Abschließende Bereinigung
+# =============================================
+echo ">>> Abschließende Bereinigung ..."
+apt autoremove -y ptyxis
+apt update -y
+apt upgrade -y
+flatpak repair
+flatpak uninstall --unused -y
+flatpak update -y
+apt autoremove --purge -y
+apt autoclean -y
+apt clean -y
+
+find /tmp -mindepth 1 -maxdepth 1 -user root -mtime +1 -exec rm -rf {} + 2>/dev/null || true
+find /var/tmp -mindepth 1 -maxdepth 1 -user root -mtime +1 -exec rm -rf {} + 2>/dev/null || true
+
+# ────────────── UNATTENDED-UPDATES WIEDER AKTIVIEREN ──────────────
+echo ">>> Stelle sicher, dass automatische Updates aktiv sind ..."
+for service in unattended-upgrades apt-daily apt-daily-upgrade; do
+    systemctl unmask "$service" 2>/dev/null || true
+done
+for timer in apt-daily.timer apt-daily-upgrade.timer; do
+    systemctl unmask "$timer" 2>/dev/null || true
+done
+systemctl start apt-daily.timer 2>/dev/null || true
+systemctl start apt-daily-upgrade.timer 2>/dev/null || true
+
+echo "   Kontrolle:"
+for unit in unattended-upgrades apt-daily.timer apt-daily-upgrade.timer; do
+    state=$(systemctl is-enabled "$unit" 2>/dev/null || echo "unknown")
+    echo "      $unit = $state"
+done
+echo "   ✅ Automatische Updates sind wieder aktiv."
+
+_UNATTENDED_BLOCKED=false
+# ──────────────────────────────────────────────────────────────────
+
+# =============================================
+# HINTERGRUNDBILD SETZEN – GANZ AM ENDE
+# =============================================
+if step_choice DONE_WALLPAPER_SET "Hintergrundbild setzen" \
+        "$_ARG_SET_WALLPAPER" "$WALLPAPER" "$STATE_WALLPAPER"; then
+if [[ -n "$WALLPAPER" ]]; then
+    echo ""
+    echo ">>> Setze Hintergrundbild: $WALLPAPER"
+
+    WP_BASE=$(basename "$WALLPAPER")
+    WP_FOUND=""
+
+    if [[ -n "$REAL_USER" ]] && [[ "$REAL_USER" != "root" ]]; then
+        USER_HOME="$(eval echo ~$REAL_USER)"
+        for candidate in \
+            "$USER_HOME/.local/share/backgrounds/$WP_BASE" \
+            "$USER_HOME/Bilder/$WP_BASE" \
+            "/usr/share/backgrounds/$WP_BASE" \
+            "/usr/share/ubuntu-plus-transformer/backgrounds/$WP_BASE" \
+            "/usr/share/ubuntu-plus-transformer/Wallpaper/$WP_BASE"; do
+            if [[ -f "$candidate" ]]; then
+                WP_FOUND="$candidate"
+                echo "   ℹ️  Persistente Quelle gefunden: $candidate"
+                break
+            fi
+        done
+    fi
+
+    if [[ -z "$WP_FOUND" ]]; then
+        WP_FOUND="$WALLPAPER"
+    fi
+
+    WALLPAPER="$WP_FOUND"
+
+    if [[ ! -f "$WALLPAPER" ]]; then
+        echo "   ❌ Datei existiert nicht: $WALLPAPER"
+    else
+        if command -v python3 >/dev/null 2>&1; then
+            WP_URI="file://$(python3 -c \
+                'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' \
+                "$WALLPAPER" 2>/dev/null || echo "${WALLPAPER// /%20}")"
+        else
+            WP_URI="file://${WALLPAPER// /%20}"
+        fi
+
+        WP_DIR=$(dirname "$WALLPAPER")
+        WP_BASE=$(basename "$WALLPAPER")
+        WP_EXT="${WP_BASE##*.}"
+        WP_NAME="${WP_BASE%.*}"
+
+        WP_DARK=""
+        for candidate in \
+            "$WP_DIR/${WP_NAME}-dark.$WP_EXT" \
+            "$WP_DIR/${WP_NAME}_dark.$WP_EXT" \
+            "$WP_DIR/dark-${WP_NAME}.$WP_EXT"; do
+            if [[ -f "$candidate" ]]; then
+                WP_DARK="$candidate"
+                break
+            fi
+        done
+
+        if [[ -n "$REAL_USER" ]] && [[ "$REAL_USER" != "root" ]]; then
+            user_uid=$(id -u "$REAL_USER" 2>/dev/null)
+            dbus_socket="/run/user/$user_uid/bus"
+
+            if [[ -S "$dbus_socket" ]]; then
+                sudo -u "$REAL_USER" env DBUS_SESSION_BUS_ADDRESS="unix:path=$dbus_socket" \
+                    gsettings set org.gnome.desktop.background picture-uri "$WP_URI" 2>/dev/null || true
+                if [[ -n "$WP_DARK" ]]; then
+                    if command -v python3 >/dev/null 2>&1; then
+                        WP_DARK_URI="file://$(python3 -c \
+                            'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' \
+                            "$WP_DARK" 2>/dev/null || echo "${WP_DARK// /%20}")"
+                    else
+                        WP_DARK_URI="file://${WP_DARK// /%20}"
+                    fi
+                    sudo -u "$REAL_USER" env DBUS_SESSION_BUS_ADDRESS="unix:path=$dbus_socket" \
+                        gsettings set org.gnome.desktop.background picture-uri-dark "$WP_DARK_URI" 2>/dev/null || true
+                else
+                    sudo -u "$REAL_USER" env DBUS_SESSION_BUS_ADDRESS="unix:path=$dbus_socket" \
+                        gsettings set org.gnome.desktop.background picture-uri-dark "$WP_URI" 2>/dev/null || true
+                fi
+            else
+                sudo -u "$REAL_USER" gsettings set org.gnome.desktop.background picture-uri "$WP_URI" 2>/dev/null || true
+                sudo -u "$REAL_USER" gsettings set org.gnome.desktop.background picture-uri-dark "$WP_URI" 2>/dev/null || true
+            fi
+
+            sleep 2
+            sync 2>/dev/null || true
+
+            CURRENT=$(sudo -u "$REAL_USER" gsettings get org.gnome.desktop.background picture-uri 2>/dev/null || echo "?")
+            echo "   ✅ Hintergrundbild gesetzt."
+            echo "   ℹ️  picture-uri jetzt: $CURRENT"
+        fi
+    fi
+fi
+step_mark DONE_WALLPAPER_SET
+state_save
+fi
+
+echo ""
+echo "===== Ubuntu-PLUS Transformer – Fertig! ====="
+echo ""
+if [[ "$NO_GAMES" == "true" ]]; then
+    echo "❌ Spiele-Unterstützung wurde DEAKTIVIERT (keine Gaming-Tools installiert)."
+else
+    echo "✅ Spiele-Unterstützung wurde AKTIVIERT (Steam, Lutris, Heroic, etc.)."
+fi
+
+case "$OFFICE_SUITE" in
+    none)        echo "❌ Büro-Software wurde DEAKTIVIERT." ;;
+    libreoffice) echo "✅ Büro-Software: LibreOffice wurde installiert." ;;
+    onlyoffice)  echo "✅ Büro-Software: ONLYOFFICE Desktop Editors wurde installiert." ;;
+    abiword)     echo "✅ Büro-Software: AbiWord (+ Gnumeric) wurde installiert." ;;
+esac
+
+BROWSER_INSTALLED=()
+[[ "$INSTALL_BRAVE"   == "true" ]] && BROWSER_INSTALLED+=("Brave")
+[[ "$INSTALL_VIVALDI" == "true" ]] && BROWSER_INSTALLED+=("Vivaldi")
+[[ "$INSTALL_CHROME"  == "true" ]] && BROWSER_INSTALLED+=("Google Chrome")
+[[ "$INSTALL_FIREFOX" == "true" ]] && BROWSER_INSTALLED+=("Firefox")
+
+BROWSER_REMOVED=()
+[[ "$REMOVE_BRAVE"   == "true" ]] && BROWSER_REMOVED+=("Brave")
+[[ "$REMOVE_VIVALDI" == "true" ]] && BROWSER_REMOVED+=("Vivaldi")
+[[ "$REMOVE_CHROME"  == "true" ]] && BROWSER_REMOVED+=("Google Chrome")
+[[ "$REMOVE_FIREFOX" == "true" ]] && BROWSER_REMOVED+=("Firefox")
+
+if [[ ${#BROWSER_INSTALLED[@]} -gt 0 ]]; then
+    echo "✅ Browser installiert: ${BROWSER_INSTALLED[*]}"
+fi
+if [[ ${#BROWSER_REMOVED[@]} -gt 0 ]]; then
+    echo "🗑️  Browser entfernt:    ${BROWSER_REMOVED[*]}"
+fi
+if [[ ${#BROWSER_INSTALLED[@]} -eq 0 && ${#BROWSER_REMOVED[@]} -eq 0 ]]; then
+    echo "ℹ️  Keine Browser-Aktionen ausgeführt."
+fi
+
+if [[ -n "$WALLPAPER" ]] && [[ -f "$WALLPAPER" ]]; then
+    echo "✅ Hintergrundbild gesetzt: $(basename "$WALLPAPER")"
+fi
+
+if [[ "$NO_FIREWALL" == "true" ]]; then
+    echo "❌ Firewall wurde DEAKTIVIERT."
+else
+    echo "✅ Firewall wurde AKTIVIERT."
+fi
+echo ""
+echo "✅ Avatare, Wallpaper und GNOME-Layout wurden für den aktuellen Benutzer gesetzt"
+echo "✅ Dokumentenvorlagen und .hidden für aktuellen und neue Benutzer"
+echo "✅ Desktop-Backup (alle Einstellungen, Erweiterungen, Wallpaper) wiederhergestellt"
+echo "✅ Weitere Pakete und Flatpaks installiert"
+echo "✅ Dock wurde aktiviert und bleibt sichtbar (autohide=false)"
+echo "✅ Nautilus: 'Verknüpfung erstellen' im Kontextmenü aktiviert"
+echo "✅ Nautilus: 'System' (Root) in der Seitenleiste hinzugefügt"
+echo ""
+
+# ────────────── STATE SPEICHERN ──────────────
+state_save
+# ─────────────────────────────────────────────
+
+# ────────────── SELBST-DEINSTALLATION ──────────────
+if dpkg -l ubuntu-plus-transformer 2>/dev/null | grep -q '^ii'; then
+    echo ""
+    echo ">>> Plane Selbst-Deinstallation des Transformers ..."
+
+    if command -v systemd-run >/dev/null 2>&1; then
+        if systemd-run --on-active=20 --unit=ubuntu-plus-selfremove-now --collect \
+                /bin/bash -c 'DEBIAN_FRONTEND=noninteractive apt-get remove -y ubuntu-plus-transformer' \
+                >/dev/null 2>&1; then
+            echo "   ✅ Sofort-Entfernung geplant (in 20 Sekunden)."
+        fi
+    fi
+
+    cat > /etc/systemd/system/ubuntu-plus-selfremove.service << 'SELFREMOVEEOF'
+[Unit]
+Description=Ubuntu-PLUS Transformer Self-Removal
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'sleep 30; DEBIAN_FRONTEND=noninteractive apt-get remove -y ubuntu-plus-transformer; systemctl disable ubuntu-plus-selfremove.service 2>/dev/null; rm -f /etc/systemd/system/ubuntu-plus-selfremove.service; systemctl daemon-reload'
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target
+SELFREMOVEEOF
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable ubuntu-plus-selfremove.service 2>/dev/null || true
+
+    echo "   ✅ Boot-Time-Entfernung aktiviert (Sicherheitsnetz)."
+    echo "      (Deine Wallpaper, Icons und Einstellungen bleiben erhalten.)"
+fi
+# ───────────────────────────────────────────────────
+
+echo ""
+echo "=== Ende: $(date) ==="
+echo "=== Log gespeichert unter: $LOG_FILE ==="
+
+if [[ "$REBOOT" == "true" ]]; then
+    echo ">>> System wird in 5 Sekunden neu gestartet ..."
+    sleep 5
+    reboot
+else
+    echo "Ein Neustart wird empfohlen, um alle Änderungen zu übernehmen."
+fi
+
+exit 0
